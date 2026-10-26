@@ -1,18 +1,18 @@
 """AirPlay 2 HLS playback session.
 
-Flow (sender side), reconstructed from receiver implementations since Apple does not
-document it:
+The flow was captured from Airflow talking to a receiver. Everything is on one
+HAP-encrypted RTSP control connection:
 
-1. Control connection: pair-verify (HAP, stored credentials) -> encrypted channel.
-2. Reverse connection: pair-verify, then ``POST /reverse`` with ``Upgrade: PTTH/1.0``
-   and the shared ``X-Apple-Session-ID``. Receiver answers ``101``.
-3. Control connection: ``POST /play`` with ``Content-Location: mlhls://localhost/...``.
-4. Receiver sends ``POST /event`` (type ``unhandledURLRequest``) on the reverse
-   connection asking for the master and media playlists (FCUP). We acknowledge each
-   and deliver the playlist with ``POST /action`` (type ``unhandledURLResponse``).
-5. Receiver fetches segments straight from our HTTP server and starts playing.
-   ``GET /playback-info`` reports progress; ``/rate``, ``/scrub`` and ``/stop``
-   control it.
+1. ``pair-verify`` with stored credentials.
+2. ``SETUP`` (session), then connect the encrypted event channel it announces, then
+   ``RECORD`` and ``GET /info``.
+3. ``SETUP`` with a type 130 stream; the receiver answers with a ``streamID``.
+4. ``POST /command`` (header ``X-Apple-StreamID``) with ``insertPlayQueueItem`` whose
+   ``Content-Location`` is a plain ``http://`` HLS playlist, then ``setRate``. Command
+   bodies are ``{"params": {"data": <binary plist>}}``.
+5. The receiver fetches the playlist and segments itself. ``POST /feedback`` keeps the
+   session alive.
+6. ``removePlayQueueItem`` and ``TEARDOWN`` end it.
 """
 
 import asyncio
@@ -23,29 +23,79 @@ from uuid import uuid4
 
 from pyatv import exceptions
 from pyatv.auth.hap_pairing import HapCredentials
+from pyatv.protocols.airplay.ap2_session import (
+    EVENTS_READ_INFO,
+    EVENTS_SALT,
+    EVENTS_WRITE_INFO,
+)
 from pyatv.protocols.airplay.auth import verify_connection
-from pyatv.support.http import HttpConnection, HttpRequest, http_connect
-
-from pyatv_hls import playlist
-from pyatv_hls.reverse import ReverseConnection, connect_reverse
+from pyatv.protocols.airplay.channels import EventChannel
+from pyatv.auth.hap_channel import setup_channel
+from pyatv.support.http import HttpConnection, HttpResponse, http_connect
+from pyatv.support.rtsp import RtspSession
 
 _LOGGER = logging.getLogger(__name__)
 
-USER_AGENT = "AirPlay/550.10"
-POLL_INTERVAL = 1.0
-START_TIMEOUT = 30.0
+STREAM_TYPE_HLS = 130
+CLIENT_TYPE_UUID = "A6B27562-B43A-4F2D-B75F-82391E250194"
+KEEPALIVE_INTERVAL = 2.0
+CM_TIMESCALE = 10_000_000
 
-# Hook so tests can skip encryption against an in-process mock receiver
-SecureFunc = Callable[[HttpConnection], Awaitable[None]]
-StatusFunc = Callable[[Dict[str, Any]], None]
+# Returns whatever setup_channel() needs to derive event channel keys, or None to
+# skip the event channel (used by tests against an unencrypted mock receiver).
+SecureFunc = Callable[[HttpConnection], Awaitable[Any]]
+EventFunc = Callable[[Dict[str, Any]], None]
 
 
 class HlsPlaybackError(exceptions.PlaybackError):
     """Raised when the receiver rejects or aborts HLS playback."""
 
 
+def _command(body: Dict[str, Any]) -> Dict[str, Any]:
+    return {"params": {"data": plistlib.dumps(body, fmt=plistlib.FMT_BINARY)}}
+
+
+def _body(resp: HttpResponse) -> Dict[str, Any]:
+    body = resp.body
+    return plistlib.loads(body.encode() if isinstance(body, str) else body)
+
+
+def _decode(data: Any) -> Any:
+    """Decode nested binary plists so events are readable."""
+    if isinstance(data, bytes) and data.startswith(b"bplist00"):
+        try:
+            return _decode(plistlib.loads(data))
+        except Exception:  # pylint: disable=broad-except
+            return data
+    if isinstance(data, dict):
+        return {k: _decode(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_decode(v) for v in data]
+    return data
+
+
+def _make_event_channel(callback: Optional[EventFunc]):
+    class _Channel(EventChannel):
+        def handle_received(self) -> None:
+            if callback:
+                data = self.buffer
+                while data:
+                    request, _, data = self.parse_request(data)
+                    if request is None:
+                        break
+                    body = request.body
+                    if isinstance(body, bytes) and body:
+                        try:
+                            callback(_decode(plistlib.loads(body)))
+                        except Exception:  # pylint: disable=broad-except
+                            _LOGGER.debug("undecodable event: %r", body[:64])
+            super().handle_received()
+
+    return _Channel
+
+
 class HlsPlayer:
-    """Plays an HLS rendition on an AirPlay 2 receiver."""
+    """Plays an HLS playlist URL on an AirPlay 2 receiver."""
 
     def __init__(
         self,
@@ -53,196 +103,201 @@ class HlsPlayer:
         port: int,
         credentials: Optional[HapCredentials] = None,
         secure: Optional[SecureFunc] = None,
-        on_status: Optional[StatusFunc] = None,
+        on_event: Optional[EventFunc] = None,
+        name: str = "pyatv-hls",
     ) -> None:
         """Initialize a new HlsPlayer."""
         self._address = address
         self._port = port
         self._credentials = credentials
         self._secure = secure or self._verify
-        self._on_status = on_status
-        self.session_id = str(uuid4()).upper()
-        self.playback_uuid = str(uuid4()).upper()
+        self._on_event = on_event
+        self._name = name
         self.control: Optional[HttpConnection] = None
-        self.reverse: Optional[ReverseConnection] = None
-        self._documents: Dict[str, bytes] = {}
-        self._requested: Dict[str, int] = {}
-        self._started = asyncio.Event()
-        self._failed: Optional[str] = None
+        self.rtsp: Optional[RtspSession] = None
+        self.stream_id: Optional[str] = None
+        self.item_uuid: Optional[str] = None
+        self.ended = asyncio.Event()
+        self._event_channel: Optional[EventChannel] = None
+        self._keepalive: Optional["asyncio.Task[None]"] = None
 
-    async def _verify(self, connection: HttpConnection) -> None:
+    async def _verify(self, connection: HttpConnection) -> Any:
         if self._credentials is None:
             raise exceptions.InvalidCredentialsError("no AirPlay credentials")
-        await verify_connection(self._credentials, connection)
+        return await verify_connection(self._credentials, connection)
 
-    # -- connection setup -------------------------------------------------
+    # -- session ----------------------------------------------------------
 
     async def connect(self) -> None:
-        """Open and authenticate the control and reverse connections."""
+        """Authenticate and set up the session and the HLS stream."""
         self.control = await http_connect(self._address, self._port)
-        await self._secure(self.control)
+        verifier = await self._secure(self.control)
+        self.rtsp = RtspSession(self.control)
 
-        self.reverse = await connect_reverse(self._address, self._port)
-        await self._secure(self.reverse)
-        self.reverse.request_handler = self._on_reverse_request
-
-        resp = await self.reverse.post(
-            "/reverse",
-            headers={
-                "Upgrade": "PTTH/1.0",
-                "Connection": "Upgrade",
-                "X-Apple-Purpose": "event",
-                "X-Apple-Session-ID": self.session_id,
-                "Content-Length": "0",
+        resp = await self._rtsp(
+            "SETUP",
+            body={
+                "deviceID": "02:00:00:00:00:01",
+                "groupContainsGroupLeader": False,
+                "groupUUID": str(uuid4()),
+                "model": "pyatv-hls",
+                "name": self._name,
+                "senderSupportsRelay": True,
+                "sessionUUID": "00000000-0000-0000-0000-000000000000",
+                "timingProtocol": "PTP",
             },
-            allow_error=True,
         )
-        if resp.code != 101:
-            raise HlsPlaybackError(f"/reverse refused: {resp.code} {resp.message}")
-        self.reverse.mark_upgraded()
+        info = _body(resp)
+        if verifier is not None:
+            if "eventPort" not in info:
+                raise HlsPlaybackError("SETUP response missing event port")
+            _, self._event_channel = await setup_channel(
+                _make_event_channel(self._event),
+                verifier,
+                self.control.remote_ip,
+                info["eventPort"],
+                EVENTS_SALT,
+                EVENTS_READ_INFO,
+                EVENTS_WRITE_INFO,
+            )
+        await self._rtsp("RECORD")
+        await self._rtsp("GET", uri="/info")
+
+        resp = await self._rtsp(
+            "SETUP",
+            body={
+                "streams": [
+                    {
+                        "clientTypeUUID": CLIENT_TYPE_UUID,
+                        "clientUUID": str(uuid4()).upper(),
+                        "controlType": 1,
+                        "type": STREAM_TYPE_HLS,
+                    }
+                ]
+            },
+        )
+        streams = _body(resp).get("streams") or []
+        if not streams or "streamID" not in streams[0]:
+            raise HlsPlaybackError("SETUP did not return a stream")
+        self.stream_id = str(streams[0]["streamID"])
+        self._keepalive = asyncio.ensure_future(self._keepalive_loop())
 
     async def close(self) -> None:
-        """Close both connections."""
-        for connection in (self.reverse, self.control):
-            if connection:
-                connection.close()
-        self.reverse = self.control = None
+        """Stop keepalives and close all connections."""
+        if self._keepalive:
+            self._keepalive.cancel()
+            self._keepalive = None
+        if self._event_channel:
+            self._event_channel.close()
+            self._event_channel = None
+        if self.control:
+            self.control.close()
+            self.control = None
 
     # -- playback ---------------------------------------------------------
 
-    def set_documents(self, master: str, media: str) -> None:
-        """Set the playlists served through FCUP."""
-        self._documents = {
-            playlist.MASTER_URL: master.encode(),
-            playlist.MEDIA_URL: media.encode(),
-        }
-
-    async def play(self, start: float = 0.0, wait: bool = True) -> None:
-        """Start playback; with ``wait`` block until the item finishes."""
-        if not self._documents:
-            raise HlsPlaybackError("set_documents() must be called before play()")
-        assert self.control
-        body = {
-            "Content-Location": playlist.MASTER_URL,
-            "Start-Position-Seconds": float(start),
-            "uuid": self.playback_uuid,
-            "rate": 1.0,
-            "clientProcName": "pyatv-hls",
-            "clientBundleID": "dev.pyatv.hls",
-        }
-        resp = await self.control.post(
-            "/play",
-            headers=self._headers(),
-            body=plistlib.dumps(body, fmt=plistlib.FMT_BINARY),
-            allow_error=True,
+    async def play(self, url: str, title: str = "", start: float = 0.0) -> None:
+        """Start playing the HLS playlist at ``url`` and begin playback."""
+        self.item_uuid = str(uuid4())
+        self.ended.clear()
+        await self._command(
+            {
+                "type": "insertPlayQueueItem",
+                "item": {
+                    "Content-Location": url,
+                    "Start-Position": {
+                        "value": int(start * CM_TIMESCALE),
+                        "timescale": CM_TIMESCALE,
+                        "flags": 1,
+                        "epoch": 0,
+                    },
+                    "clientBundleID": "com.apple.WebKit.WebContent",
+                    "referenceRestrictions": 3,
+                    "uuid": self.item_uuid,
+                },
+                "metadata": {
+                    "Album": "",
+                    "Artist": "",
+                    "Title": title,
+                    "TotalTrackCount": "",
+                    "TrackNumber": "",
+                },
+            }
         )
-        if resp.code >= 400:
-            raise HlsPlaybackError(f"/play refused: {resp.code} {resp.message}")
+        await self.set_rate(1.0)
 
-        try:
-            await asyncio.wait_for(self._started.wait(), START_TIMEOUT)
-        except asyncio.TimeoutError as ex:
-            raise HlsPlaybackError(
-                "receiver never requested the playlists "
-                f"(asked for: {sorted(self._requested)})"
-            ) from ex
-        if self._failed:
-            raise HlsPlaybackError(self._failed)
-        if wait:
-            await self._monitor()
-
-    async def _monitor(self) -> None:
-        """Poll ``/playback-info`` until the item ends."""
-        assert self.control
-        seen_playing = False
-        while True:
-            await asyncio.sleep(POLL_INTERVAL)
-            resp = await self.control.get("/playback-info", allow_error=True)
-            if resp.code >= 400 or not resp.body:
-                if seen_playing:
-                    return
-                continue
-            info = plistlib.loads(
-                resp.body if isinstance(resp.body, bytes) else resp.body.encode()
-            )
-            if self._on_status:
-                self._on_status(info)
-            if info.get("duration", 0) < 0:
-                return
-            seen_playing = seen_playing or info.get("rate", 0) > 0
+    async def set_rate(self, rate: float) -> None:
+        """Set the playback rate: 1 plays, 0 pauses."""
+        await self._command({"type": "setRate", "rate": rate})
 
     async def pause(self) -> None:
         """Pause playback."""
-        await self._command("/rate?value=0.000000")
+        await self.set_rate(0.0)
 
     async def resume(self) -> None:
         """Resume playback."""
-        await self._command("/rate?value=1.000000")
+        await self.set_rate(1.0)
 
-    async def seek(self, seconds: float) -> None:
-        """Seek to ``seconds``."""
-        await self._command(f"/scrub?position={seconds:.3f}")
+    async def wait_until_ended(self) -> None:
+        """Block until the receiver reports the item played to the end."""
+        await self.ended.wait()
 
     async def stop(self) -> None:
-        """Stop playback."""
-        await self._command("/stop")
-
-    async def _command(self, path: str) -> None:
-        assert self.control
-        await self.control.post(path, headers=self._headers(), allow_error=True)
-
-    def _headers(self) -> Dict[str, str]:
-        return {
-            "User-Agent": USER_AGENT,
-            "Content-Type": "application/x-apple-binary-plist",
-            "X-Apple-Session-ID": self.session_id,
-        }
-
-    # -- reverse channel (FCUP) -------------------------------------------
-
-    async def _on_reverse_request(self, request: HttpRequest) -> None:
-        assert self.reverse
-        body = request.body.encode() if isinstance(request.body, str) else request.body
-        try:
-            event = plistlib.loads(body) if body else {}
-        except Exception:  # noqa: BLE001 - malformed events must not kill the loop
-            _LOGGER.warning("Unparseable reverse request %s", request.path)
-            self.reverse.send_response(400, "Bad Request")
+        """Remove the item and tear the stream down."""
+        if self.rtsp is None:
             return
+        try:
+            if self.item_uuid:
+                await self._command(
+                    {"type": "removePlayQueueItem", "item": {"uuid": self.item_uuid}}
+                )
+            await self._rtsp(
+                "TEARDOWN",
+                body=_command({"streamID": self.stream_id, "type": STREAM_TYPE_HLS}),
+            )
+        except (exceptions.ConnectionLostError, TimeoutError):
+            _LOGGER.debug("connection gone while stopping")
 
-        self.reverse.send_response(200, "OK")
-        kind = event.get("type")
-        _LOGGER.debug("Reverse event %s: %s", kind, event)
+    # -- internals --------------------------------------------------------
 
-        if kind == "unhandledURLRequest":
-            await self._answer_fcup(event.get("request", {}))
-        elif kind == "playbackError" or kind == "error":
-            self._failed = f"receiver reported {event}"
-            self._started.set()
-
-    async def _answer_fcup(self, request: Dict[str, Any]) -> None:
-        assert self.control
-        url = request.get("FCUP_Response_URL", "")
-        request_id = request.get("FCUP_Response_RequestID", 0)
-        self._requested[url] = request_id
-
-        data = self._documents.get(url)
-        params: Dict[str, Any] = {
-            "FCUP_Response_URL": url,
-            "FCUP_Response_RequestID": request_id,
-            "FCUP_Response_StatusCode": 200 if data is not None else 404,
-            "FCUP_Response_Data": data or b"",
-        }
-        action = {"type": "unhandledURLResponse", "params": params}
-        resp = await self.control.post(
-            "/action",
-            headers=self._headers(),
-            body=plistlib.dumps(action, fmt=plistlib.FMT_BINARY),
-            allow_error=True,
+    async def _command(self, body: Dict[str, Any]) -> HttpResponse:
+        return await self._rtsp(
+            "POST",
+            uri="/command",
+            headers={"X-Apple-StreamID": self.stream_id},
+            body=_command(body),
         )
-        if resp.code >= 400:
-            self._failed = f"/action rejected: {resp.code} {resp.message}"
-        if data is None:
-            self._failed = f"receiver asked for unknown document {url}"
-        if url == playlist.MEDIA_URL or self._failed:
-            self._started.set()
+
+    async def _rtsp(
+        self,
+        method: str,
+        uri: Optional[str] = None,
+        headers: Optional[Dict[str, Any]] = None,
+        body: Optional[Dict[str, Any]] = None,
+    ) -> HttpResponse:
+        assert self.rtsp is not None
+        resp = await self.rtsp.exchange(
+            method, uri=uri, headers=headers, body=body, allow_error=True
+        )
+        if resp.code != 200:
+            raise HlsPlaybackError(
+                f"{method} {uri or ''} refused: {resp.code} {resp.message}"
+            )
+        return resp
+
+    async def _keepalive_loop(self) -> None:
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            try:
+                await self._rtsp("POST", uri="/feedback")
+            except (exceptions.ConnectionLostError, TimeoutError, HlsPlaybackError):
+                _LOGGER.debug("keepalive failed; stopping it")
+                self.ended.set()
+                return
+
+    def _event(self, event: Dict[str, Any]) -> None:
+        _LOGGER.debug("event: %s", event)
+        if "itemPlayedToEnd" in repr(event):
+            self.ended.set()
+        if self._on_event:
+            self._on_event(event)

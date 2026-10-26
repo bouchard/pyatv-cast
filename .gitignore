@@ -13,3 +13,5 @@ uv.lock
 *.ts
 *.mp4
 *.mkv
+.coverage
+htmlcov/

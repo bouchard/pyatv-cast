@@ -1,0 +1,308 @@
+"""Just-in-time HLS: serve a media file as HLS without writing any intermediate files.
+
+A VOD playlist is built up front from the source's keyframes. Each ``.ts`` segment is
+produced by ffmpeg only when the receiver asks for it. H.264 video and AAC audio are
+copied untouched (remuxed); anything else is transcoded, and only that stream.
+"""
+
+import asyncio
+import json
+import logging
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from aiohttp import web
+
+_LOGGER = logging.getLogger(__name__)
+
+PLAYLIST_NAME = "index.m3u8"
+SEGMENT_TARGET_SECONDS = 6.0
+CACHE_SEGMENTS = 6
+MAX_FFMPEG = 2
+
+
+@dataclass
+class Segment:
+    """One planned HLS segment."""
+
+    start: float
+    duration: float
+    # ffmpeg ``-t`` value: stops just before the next keyframe's *decode* time, so
+    # B-frame reordering cannot make neighbouring segments overlap
+    cut: float
+
+
+@dataclass
+class MediaPlan:
+    """What ffmpeg will do for this source, plus the planned segments."""
+
+    source: Path
+    duration: float
+    copy_video: bool
+    copy_audio: bool
+    has_audio: bool
+    audio_index: int
+    # Added to every segment's timestamps. The first video packet has a negative decode
+    # time, which the muxer would otherwise shift for segment 0 only.
+    ts_shift: float = 0.0
+    segments: List[Segment] = field(default_factory=list)
+
+    def playlist(self) -> str:
+        """Render the VOD media playlist."""
+        target = int(max(s.duration for s in self.segments) + 0.999)
+        lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            f"#EXT-X-TARGETDURATION:{target}",
+            "#EXT-X-MEDIA-SEQUENCE:0",
+            "#EXT-X-PLAYLIST-TYPE:VOD",
+        ]
+        for i, seg in enumerate(self.segments):
+            lines += [f"#EXTINF:{seg.duration:.6f},", f"seg{i:05d}.ts"]
+        lines.append("#EXT-X-ENDLIST")
+        return "\n".join(lines) + "\n"
+
+
+async def _run(*args: str) -> bytes:
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"{args[0]} failed: {err.decode(errors='replace')[-500:]}")
+    return out
+
+
+async def probe(source: Path) -> dict:
+    """Return stream and format info for ``source`` via ffprobe."""
+    out = await _run(
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_streams", "-show_format", str(source),
+    )  # fmt: skip
+    return json.loads(out)
+
+
+async def keyframes(source: Path) -> List[Tuple[float, float]]:
+    """Return (presentation, decode) time of every video keyframe, ascending."""
+    out = await _run(
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time,dts_time,flags", "-of", "csv=p=0", str(source),
+    )  # fmt: skip
+    keys = []
+    for line in out.decode().splitlines():
+        fields = line.split(",")
+        if len(fields) < 3 or not fields[2].startswith("K") or "N/A" in fields[:2]:
+            continue
+        keys.append((float(fields[0]), float(fields[1])))
+    return sorted(keys)
+
+
+def plan_segments(
+    keys: List[Tuple[float, float]],
+    duration: float,
+    target: float = SEGMENT_TARGET_SECONDS,
+) -> List[Segment]:
+    """Cut at the first keyframe at least ``target`` seconds after the last cut."""
+    cuts = [(0.0, 0.0)]
+    for pts, dts in keys:
+        if pts - cuts[-1][0] >= target:
+            cuts.append((pts, dts))
+    segments = []
+    for i, (start, _) in enumerate(cuts):
+        end_pts, end_dts = cuts[i + 1] if i + 1 < len(cuts) else (duration, duration)
+        if end_pts - start > 0.001:
+            segments.append(Segment(start, end_pts - start, end_dts - start - 0.001))
+    return segments
+
+
+def _pick_audio(streams: List[dict]) -> Tuple[Optional[dict], int]:
+    audio = [s for s in streams if s["codec_type"] == "audio"]
+    if not audio:
+        return None, 0
+    for i, s in enumerate(audio):
+        if s.get("tags", {}).get("language") in ("eng", "en"):
+            return s, i
+    return audio[0], 0
+
+
+async def plan(source: Path) -> MediaPlan:
+    """Probe ``source`` and decide what has to be converted."""
+    info = await probe(source)
+    video = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
+    if video is None:
+        raise ValueError(f"{source} has no video stream")
+    audio, audio_index = _pick_audio(info["streams"])
+    duration = float(info["format"]["duration"])
+    result = MediaPlan(
+        source=source,
+        duration=duration,
+        copy_video=video["codec_name"] == "h264" and video.get("pix_fmt") == "yuv420p",
+        copy_audio=audio is not None and audio["codec_name"] == "aac",
+        has_audio=audio is not None,
+        audio_index=audio_index,
+    )
+    keys = await keyframes(source)
+    result.ts_shift = max(0.0, -keys[0][1]) if keys else 0.0
+    result.segments = plan_segments(keys, duration)
+    _LOGGER.info(
+        "%s: %d segments, video %s, audio %s",
+        source.name, len(result.segments),
+        "copy" if result.copy_video else f"transcode from {video['codec_name']}",
+        "none" if not audio else "copy" if result.copy_audio else
+        f"transcode from {audio['codec_name']}",
+    )  # fmt: skip
+    return result
+
+
+def segment_command(media: MediaPlan, index: int) -> List[str]:
+    """Build the ffmpeg command that writes segment ``index`` to stdout."""
+    seg = media.segments[index]
+    cmd = [
+        "ffmpeg", "-nostdin", "-v", "error",
+        "-ss", f"{seg.start:.6f}", "-i", str(media.source), "-t", f"{seg.cut:.6f}",
+        "-map", "0:v:0",
+    ]  # fmt: skip
+    if media.has_audio:
+        cmd += ["-map", f"0:a:{media.audio_index}"]
+    if media.copy_video:
+        cmd += ["-c:v", "copy", "-bsf:v", "h264_mp4toannexb"]
+    else:
+        cmd += [
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p", "-force_key_frames", "expr:gte(t,0)",
+        ]  # fmt: skip
+    if media.has_audio:
+        if media.copy_audio:
+            cmd += ["-c:a", "copy"]
+        else:
+            cmd += ["-c:a", "aac", "-b:a", "256k", "-ac", "2"]
+    cmd += [
+        "-output_ts_offset", f"{seg.start + media.ts_shift:.6f}", "-muxdelay", "0", "-muxpreload", "0",
+        "-f", "mpegts", "pipe:1",
+    ]  # fmt: skip
+    return cmd
+
+
+class JitHlsServer:
+    """HTTP server that converts to HLS on demand.
+
+    Serves ``/index.m3u8`` and ``/segNNNNN.ts``. ``static_dir`` mode serves an existing
+    HLS directory as is.
+    """
+
+    def __init__(self, media: MediaPlan, address: str, port: int = 0) -> None:
+        """Initialize a new JitHlsServer."""
+        self._media = media
+        self._address = address
+        self._port = port
+        self._cache: "OrderedDict[int, bytes]" = OrderedDict()
+        self._inflight: dict = {}
+        self._slots = asyncio.Semaphore(MAX_FFMPEG)
+        self._runner: Optional[web.AppRunner] = None
+
+    async def _segment_bytes(self, index: int) -> bytes:
+        if index in self._cache:
+            self._cache.move_to_end(index)
+            return self._cache[index]
+        if index not in self._inflight:
+            self._inflight[index] = asyncio.ensure_future(self._convert(index))
+        try:
+            return await asyncio.shield(self._inflight[index])
+        finally:
+            task = self._inflight.get(index)
+            if task is not None and task.done():
+                del self._inflight[index]
+
+    async def _convert(self, index: int) -> bytes:
+        async with self._slots:
+            data = await _run(*segment_command(self._media, index))
+        self._cache[index] = data
+        while len(self._cache) > CACHE_SEGMENTS:
+            self._cache.popitem(last=False)
+        return data
+
+    async def _playlist(self, request: web.Request) -> web.Response:
+        return web.Response(
+            text=self._media.playlist(), content_type="application/vnd.apple.mpegurl"
+        )
+
+    async def _segment(self, request: web.Request) -> web.Response:
+        index = int(request.match_info["index"])
+        if not 0 <= index < len(self._media.segments):
+            raise web.HTTPNotFound()
+        try:
+            data = await self._segment_bytes(index)
+        except RuntimeError as ex:
+            _LOGGER.error("segment %d failed: %s", index, ex)
+            raise web.HTTPInternalServerError() from ex
+        _LOGGER.debug("served segment %d (%d bytes)", index, len(data))
+        return web.Response(body=data, content_type="video/mp2t")
+
+    async def start(self) -> str:
+        """Start serving and return the playlist URL."""
+        app = web.Application()
+        app.router.add_get(f"/{PLAYLIST_NAME}", self._playlist)
+        app.router.add_get(r"/seg{index:\d+}.ts", self._segment)
+        self._runner = web.AppRunner(app, access_log=None)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, self._address, self._port)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
+        return f"http://{self._address}:{port}/{PLAYLIST_NAME}"
+
+    async def stop(self) -> None:
+        """Stop serving and drop cached segments."""
+        if self._runner:
+            await self._runner.cleanup()
+            self._runner = None
+        self._cache.clear()
+
+
+async def convert_to_directory(media: MediaPlan, directory: Path) -> Path:
+    """Convert every segment up front into ``directory`` and return the playlist path.
+
+    The non-just-in-time mode: same segments as :class:`JitHlsServer`, but written to
+    disk before playback starts.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    slots = asyncio.Semaphore(MAX_FFMPEG)
+
+    async def one(index: int) -> None:
+        async with slots:
+            data = await _run(*segment_command(media, index))
+        (directory / f"seg{index:05d}.ts").write_bytes(data)
+
+    await asyncio.gather(*(one(i) for i in range(len(media.segments))))
+    playlist = directory / PLAYLIST_NAME
+    playlist.write_text(media.playlist())
+    return playlist
+
+
+class StaticHlsServer:
+    """Serve an existing HLS directory (a local ``.m3u8`` and its segments)."""
+
+    def __init__(self, playlist: Path, address: str, port: int = 0) -> None:
+        """Initialize a new StaticHlsServer."""
+        self._playlist = playlist
+        self._address = address
+        self._port = port
+        self._runner: Optional[web.AppRunner] = None
+
+    async def start(self) -> str:
+        """Start serving and return the playlist URL."""
+        app = web.Application()
+        app.router.add_static("/", self._playlist.parent, follow_symlinks=False)
+        self._runner = web.AppRunner(app, access_log=None)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, self._address, self._port)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
+        return f"http://{self._address}:{port}/{self._playlist.name}"
+
+    async def stop(self) -> None:
+        """Stop serving."""
+        if self._runner:
+            await self._runner.cleanup()
+            self._runner = None

@@ -1,7 +1,7 @@
 [project]
 name = "pyatv-hls"
 version = "0.1.0"
-description = "Experimental AirPlay 2 HLS video sender for pyatv"
+description = "AirPlay 2 HLS video sender for pyatv with just-in-time conversion"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -28,7 +28,16 @@ build-backend = "hatchling.build"
 packages = ["pyatv_hls"]
 
 [dependency-groups]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["pytest", "pytest-asyncio", "pytest-cov"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+addopts = "--cov --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["pyatv_hls"]
+
+[tool.coverage.report]
+fail_under = 95
+show_missing = true
+exclude_also = ["if __name__ == .__main__.:"]
