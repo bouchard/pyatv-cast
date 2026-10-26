@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+uv.lock
+
+# Never commit pairing credentials or media
+.pyatv.conf
+*.m3u8
+*.ts
+*.mp4
+*.mkv

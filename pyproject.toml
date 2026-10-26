@@ -1,0 +1,34 @@
+[project]
+name = "pyatv-hls"
+version = "0.1.0"
+description = "AirPlay 2 HLS video sender extension for pyatv (for receivers that only accept HLS, e.g. Samsung TVs)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Brady Bouchard" }]
+requires-python = ">=3.9"
+dependencies = [
+    "pyatv>=0.16",
+    "srptools<2",
+    "aiohttp",
+]
+
+[project.urls]
+Homepage = "https://github.com/bouchard/pyatv-hls"
+Issues = "https://github.com/bouchard/pyatv-hls/issues"
+
+[project.scripts]
+pyatv-hls = "pyatv_hls.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pyatv_hls"]
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
