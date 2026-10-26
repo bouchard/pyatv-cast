@@ -1,0 +1,291 @@
+"""DLNA: description parsing, SSDP discovery, SOAP control and polling (mock renderer)."""
+
+import asyncio
+import xml.etree.ElementTree as ET
+
+import aiohttp
+import pytest
+from aiohttp import web
+
+from pyatv_hls import dlna
+
+DESCRIPTION = """<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <friendlyName>[TV] Living Room</friendlyName>
+    <UDN>uuid:1234</UDN>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>
+        <controlURL>/rc</controlURL>
+      </service>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+        <controlURL>/ctl</controlURL>
+      </service>
+    </serviceList>
+  </device>
+</root>"""
+
+ENVELOPE = (
+    '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>{}'
+    "</s:Body></s:Envelope>"
+)
+
+
+class MockRenderer:
+    """An aiohttp server speaking just enough UPnP AVTransport."""
+
+    def __init__(self):
+        self.actions = []
+        self.states = ["STOPPED"]  # consumed by GetTransportInfo, last one repeats
+        self.fail = {}  # action name -> HTTP status
+
+    async def description(self, request):
+        return web.Response(text=DESCRIPTION, content_type="text/xml")
+
+    async def control(self, request):
+        action = request.headers["SOAPACTION"].strip('"').split("#")[1]
+        body = ET.fromstring(await request.read())
+        args = {
+            el.tag: el.text
+            for el in body.find(f".//{{{dlna.AV_TRANSPORT}}}{action}")
+        }
+        self.actions.append((action, args))
+        if action in self.fail:
+            error = (
+                '<s:Fault><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0">'
+                "<errorCode>701</errorCode><errorDescription>Nope</errorDescription>"
+                "</UPnPError></detail></s:Fault>"
+            )
+            return web.Response(status=self.fail[action], text=ENVELOPE.format(error))
+        inner = ""
+        if action == "GetTransportInfo":
+            state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
+            inner = f"<CurrentTransportState>{state}</CurrentTransportState>"
+        reply = f'<u:{action}Response xmlns:u="{dlna.AV_TRANSPORT}">{inner}</u:{action}Response>'
+        return web.Response(text=ENVELOPE.format(reply), content_type="text/xml")
+
+    async def start(self):
+        app = web.Application()
+        app.router.add_get("/dmr", self.description)
+        app.router.add_post("/ctl", self.control)
+        self.runner = web.AppRunner(app, access_log=None)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await site.start()
+        self.port = site._server.sockets[0].getsockname()[1]
+        return f"http://127.0.0.1:{self.port}/dmr"
+
+
+@pytest.fixture
+async def renderer(monkeypatch):
+    monkeypatch.setattr(dlna, "POLL_INTERVAL", 0.02)
+    mock = MockRenderer()
+    mock.location = await mock.start()
+    yield mock
+    await mock.runner.cleanup()
+
+
+def test_parse_description():
+    renderer = dlna.parse_description("http://10.0.0.5:9197/dmr", DESCRIPTION)
+    assert renderer.friendly_name == "[TV] Living Room" and renderer.udn == "uuid:1234"
+    assert renderer.control_url == "http://10.0.0.5:9197/ctl"
+    assert renderer.host == "10.0.0.5"
+
+
+def test_parse_description_honours_url_base():
+    xml = DESCRIPTION.replace("<device>", "<URLBase>http://10.0.0.6:80/</URLBase><device>")
+    assert dlna.parse_description("http://x/dmr", xml).control_url == "http://10.0.0.6:80/ctl"
+
+
+def test_parse_description_errors():
+    with pytest.raises(dlna.DlnaError, match="not a UPnP device"):
+        dlna.parse_description("http://x", '<root xmlns="urn:schemas-upnp-org:device-1-0"/>')
+    no_av = DESCRIPTION.replace("AVTransport", "Other")
+    with pytest.raises(dlna.DlnaError, match="no AVTransport"):
+        dlna.parse_description("http://x", no_av)
+
+
+def test_didl_escapes_and_describes_the_item():
+    text = dlna.didl("http://h/a.m3u8?x=1&y=2", "Tom & <Jerry>", "application/vnd.apple.mpegurl")
+    root = ET.fromstring(text)  # well-formed despite the special characters
+    ns = {"d": "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/", "dc": "http://purl.org/dc/elements/1.1/"}
+    assert root.find(".//dc:title", ns).text == "Tom & <Jerry>"
+    res = root.find(".//d:res", ns)
+    assert res.text == "http://h/a.m3u8?x=1&y=2"
+    assert "application/vnd.apple.mpegurl" in res.attrib["protocolInfo"]
+
+
+def test_clock_formats_seconds():
+    assert dlna.clock(0) == "0:00:00"
+    assert dlna.clock(3725.9) == "1:02:05"
+
+
+class _Responder(asyncio.DatagramProtocol):
+    def __init__(self, location):
+        self.location = location
+        self.queries = []
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        self.queries.append(data.decode())
+        reply = f"HTTP/1.1 200 OK\r\nLOCATION: {self.location}\r\nST: x\r\n\r\n"
+        self.transport.sendto(reply.encode(), addr)
+        self.transport.sendto(reply.encode(), addr)  # duplicates are collapsed
+
+
+async def _responder(location):
+    loop = asyncio.get_running_loop()
+    transport, protocol = await loop.create_datagram_endpoint(
+        lambda: _Responder(location), local_addr=("127.0.0.1", 0)
+    )
+    return transport, protocol, transport.get_extra_info("sockname")
+
+
+async def test_ssdp_search_collects_locations():
+    transport, responder, target = await _responder("http://127.0.0.1:1/dmr")
+    try:
+        assert await dlna.ssdp_search(timeout=0.2, target=target) == ["http://127.0.0.1:1/dmr"]
+    finally:
+        transport.close()
+    assert dlna.MEDIA_RENDERER in responder.queries[0]
+
+
+async def test_find_renderer_by_location_host_and_name(renderer):
+    transport, _, target = await _responder(renderer.location)
+    try:
+        by_loc = await dlna.find_renderer(location=renderer.location)
+        by_host = await dlna.find_renderer(host="127.0.0.1", timeout=0.2, target=target)
+        by_name = await dlna.find_renderer(name="living room", timeout=0.2, target=target)
+    finally:
+        transport.close()
+    assert by_loc.friendly_name == by_host.friendly_name == by_name.friendly_name
+
+
+async def test_find_renderer_reports_what_it_saw(renderer):
+    transport, _, target = await _responder(renderer.location)
+    try:
+        with pytest.raises(dlna.DlnaError, match=r"saw: \[TV\] Living Room"):
+            await dlna.find_renderer(host="10.9.9.9", timeout=0.2, target=target)
+    finally:
+        transport.close()
+
+
+async def test_find_renderer_skips_unreachable_devices():
+    transport, _, target = await _responder("http://127.0.0.1:9/dmr")
+    try:
+        with pytest.raises(dlna.DlnaError, match="saw: none"):
+            await dlna.find_renderer(host="127.0.0.1", timeout=0.2, target=target)
+    finally:
+        transport.close()
+
+
+async def _player(mock):
+    player = dlna.DlnaPlayer(await dlna.find_renderer(location=mock.location))
+    await player.connect()
+    return player
+
+
+async def test_play_sequence_and_controls(renderer):
+    renderer.states = ["TRANSITIONING", "PLAYING", "PLAYING", "STOPPED"]
+    player = await _player(renderer)
+    assert player.local_ip == "127.0.0.1"
+
+    await player.play("http://127.0.0.1:1/index.m3u8", title="Movie", start=125.0)
+    await asyncio.wait_for(player.wait_until_ended(), 5)  # stops after it has played
+    await player.pause()
+    await player.resume()
+    await player.stop()
+    await player.close()
+
+    names = [a for a, _ in renderer.actions]
+    assert names[:2] == ["SetAVTransportURI", "Play"]
+    assert "Seek" in names and names[-3:] == ["Pause", "Play", "Stop"]
+    uri = dict(renderer.actions[0][1])
+    assert uri["CurrentURI"] == "http://127.0.0.1:1/index.m3u8"
+    assert "Movie" in uri["CurrentURIMetaData"]
+    seek = next(args for a, args in renderer.actions if a == "Seek")
+    assert (seek["Unit"], seek["Target"]) == ("REL_TIME", "0:02:05")
+    assert all(args["InstanceID"] == "0" for _, args in renderer.actions)
+
+
+async def test_not_ended_before_it_has_played(renderer):
+    renderer.states = ["NO_MEDIA_PRESENT"]  # e.g. still loading
+    player = await _player(renderer)
+    await player.play("http://x/a.m3u8")
+    await asyncio.sleep(0.15)
+    assert not player.ended.is_set()
+    await player.close()
+
+
+async def test_seek_gives_up_if_playback_never_starts(renderer, monkeypatch):
+    monkeypatch.setattr(dlna, "PLAY_WAIT", 0.1)
+    renderer.states = ["TRANSITIONING"]
+    player = await _player(renderer)
+    with pytest.raises(dlna.DlnaError, match="never reached PLAYING"):
+        await player.play("http://x/a.m3u8", start=30.0)
+    await player.close()
+
+
+async def test_upnp_errors_are_reported(renderer):
+    renderer.fail["SetAVTransportURI"] = 500
+    player = await _player(renderer)
+    with pytest.raises(dlna.DlnaError, match="HTTP 500 UPnP error 701: Nope"):
+        await player.play("http://x/a.m3u8")
+    await player.close()
+
+
+async def test_error_without_upnp_body(renderer):
+    renderer.fail["Pause"] = 400
+    player = await _player(renderer)
+    renderer.fail["Pause"] = 400
+    assert dlna._upnp_error("not xml") == ""
+    with pytest.raises(dlna.DlnaError, match="Pause failed: HTTP 400"):
+        await player.pause()
+    await player.close()
+
+
+async def test_polling_gives_up_when_the_renderer_disappears(renderer, monkeypatch):
+    monkeypatch.setattr(dlna, "POLL_FAILURES", 2)
+    renderer.states = ["PLAYING"]
+    player = await _player(renderer)
+    await player.play("http://x/a.m3u8")
+    renderer.fail["GetTransportInfo"] = 500
+    await asyncio.wait_for(player.wait_until_ended(), 5)
+    await player.close()
+
+
+async def test_stop_tolerates_a_dead_renderer(renderer):
+    player = await _player(renderer)
+    renderer.fail["Stop"] = 500
+    await player.stop()  # swallowed
+    await player.close()
+    await player.stop()  # never connected / already closed: no-op
+    await player.close()
+
+
+async def test_direct_file_server_supports_ranges(tmp_path):
+    media = tmp_path / "movie.mkv"
+    media.write_bytes(bytes(range(100)))
+    server = dlna.DirectFileServer(media, "127.0.0.1")
+    url = await server.start()
+    try:
+        assert url.endswith("/media.mkv")
+        async with aiohttp.ClientSession() as http:
+            async with http.get(url, headers={"Range": "bytes=10-19"}) as resp:
+                assert resp.status == 206
+                assert await resp.read() == bytes(range(10, 20))
+                assert resp.headers["transferMode.dlna.org"] == "Streaming"
+    finally:
+        await server.stop()
+    await server.stop()
+
+
+def test_guess_mime():
+    from pathlib import Path
+
+    assert dlna.guess_mime(Path("a.mp4")) == "video/mp4"
+    assert dlna.guess_mime(Path("a.unknownext")) == "video/mp4"

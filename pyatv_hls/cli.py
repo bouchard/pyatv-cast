@@ -7,15 +7,17 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, NamedTuple, Optional
 
 import pyatv
 from pyatv.auth.hap_pairing import parse_credentials
 from pyatv.const import Protocol
 from pyatv.storage.file_storage import FileStorage
 
-from pyatv_hls import hls
+from pyatv_hls import dlna, hls
 from pyatv_hls.session import HlsPlayer
+
+HLS_MIME = "application/vnd.apple.mpegurl"
 
 
 async def _find_device(args: argparse.Namespace):
@@ -37,15 +39,29 @@ async def _find_device(args: argparse.Namespace):
     return str(config.address), service.port, parse_credentials(creds)
 
 
-async def _serve(args: argparse.Namespace, local_ip: str, workdir: Optional[Path]):
-    """Return (playlist_url, server_or_None, duration_or_None) for the source."""
+class Source(NamedTuple):
+    """What to tell the receiver to fetch, and the server providing it."""
+
+    url: str
+    server: Optional[Any]
+    duration: Optional[float]
+    mime: str = HLS_MIME
+
+
+async def _serve(args: argparse.Namespace, local_ip: str, workdir: Optional[Path]) -> Source:
+    """Prepare ``args.source`` for the receiver and start serving it."""
     source = args.source
     if source.startswith(("http://", "https://")):
-        return source, None, None
+        return Source(source, None, None)
     path = Path(source).resolve()
     if path.suffix == ".m3u8":
         server = hls.StaticHlsServer(path, local_ip)
-        return await server.start(), server, None
+        return Source(await server.start(), server, None)
+    if args.direct:
+        info = await hls.probe(path)
+        direct = dlna.DirectFileServer(path, local_ip)
+        duration = float(info["format"]["duration"])
+        return Source(await direct.start(), direct, duration, dlna.guess_mime(path))
     media = await hls.plan(path)
     if args.jit:
         server = hls.JitHlsServer(media, local_ip)
@@ -53,7 +69,19 @@ async def _serve(args: argparse.Namespace, local_ip: str, workdir: Optional[Path
         print(f"Converting {path.name} ({len(media.segments)} segments) ...")
         playlist = await hls.convert_to_directory(media, workdir)
         server = hls.StaticHlsServer(playlist, local_ip)
-    return await server.start(), server, media.duration
+    return Source(await server.start(), server, media.duration)
+
+
+async def _make_player(args: argparse.Namespace):
+    """Find the receiver and return an unconnected player for the chosen protocol."""
+    if args.protocol == "dlna":
+        try:
+            renderer = await dlna.find_renderer(args.host, args.id, args.location)
+        except dlna.DlnaError as ex:
+            sys.exit(str(ex))
+        return dlna.DlnaPlayer(renderer)
+    address, port, credentials = await _find_device(args)
+    return HlsPlayer(address, port, credentials)
 
 
 async def _progress(started: float, duration) -> None:
@@ -65,24 +93,23 @@ async def _progress(started: float, duration) -> None:
 
 
 async def play(args: argparse.Namespace) -> None:
-    """Connect, serve the media just in time, and play until it ends."""
-    address, port, credentials = await _find_device(args)
+    """Connect, serve the media, and play until it ends."""
+    player = await _make_player(args)
     # Only created when just-in-time conversion is turned off
     workdir = None
     if not args.jit:
         workdir = tempfile.TemporaryDirectory(prefix="pyatv-hls-", dir=args.workdir)
-    player = HlsPlayer(address, port, credentials)
     await player.connect()
     server = None
     try:
-        assert player.control
-        url, server, duration = await _serve(
-            args, player.control.local_ip, Path(workdir.name) if workdir else None
-        )
-        await player.play(url, title=Path(args.source).stem, start=args.start)
-        ticker = asyncio.ensure_future(_progress(time.monotonic(), duration))
+        source = await _serve(args, player.local_ip, Path(workdir.name) if workdir else None)
+        server = source.server
+        if isinstance(player, dlna.DlnaPlayer):
+            player.mime = source.mime
+        await player.play(source.url, title=Path(args.source).stem, start=args.start)
+        ticker = asyncio.ensure_future(_progress(time.monotonic(), source.duration))
         try:
-            limit = (duration - args.start + 30) if duration else None
+            limit = (source.duration - args.start + 30) if source.duration else None
             await asyncio.wait_for(player.wait_until_ended(), limit)
         except asyncio.TimeoutError:
             pass
@@ -104,9 +131,18 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("play", help="play a video file, .m3u8 or http(s) HLS URL")
     p.add_argument("source")
-    target = p.add_mutually_exclusive_group(required=True)
-    target.add_argument("--id", help="device identifier, e.g. F0:70:4F:CD:3A:6C")
+    p.add_argument(
+        "--protocol", choices=["airplay", "dlna"], default="airplay",
+        help="how to reach the receiver (default: airplay)",
+    )  # fmt: skip
+    target = p.add_mutually_exclusive_group()
+    target.add_argument("--id", help="AirPlay device identifier, or part of a DLNA name")
     target.add_argument("--host", help="device IP address")
+    target.add_argument("--location", help="DLNA device description URL (skips discovery)")
+    p.add_argument(
+        "--direct", action="store_true",
+        help="DLNA: serve the file unchanged instead of as HLS, for renderers without HLS",
+    )  # fmt: skip
     p.add_argument("--credentials", help="override stored AirPlay credentials")
     p.add_argument(
         "--jit", action=argparse.BooleanOptionalAction, default=True,
@@ -117,6 +153,10 @@ def main() -> None:
     p.add_argument("--start", type=float, default=0.0, help="start position (s)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
+    if not (args.id or args.host or args.location):
+        parser.error("one of --id, --host or --location is required")
+    if args.protocol == "airplay" and (args.location or args.direct):
+        parser.error("--location and --direct only apply to --protocol dlna")
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
     try:

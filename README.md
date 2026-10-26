@@ -2,7 +2,8 @@
 
 An AirPlay 2 **video sender** that extends [pyatv](https://github.com/postlund/pyatv).
 It plays a video file (or an HLS URL) on AirPlay 2 receivers that pull HLS over HTTP,
-and converts the file to HLS **just in time**, so nothing is written to disk.
+and converts the file to HLS **just in time**, so nothing is written to disk. It can
+also send to **DLNA** (UPnP MediaRenderer) TVs as an alternative, see [DLNA](#dlna).
 
 pyatv can stream audio (`stream_file`) and, on Apple TVs, play a URL (`play_url`). On
 some receivers, notably Samsung TVs, `stream_file` shows an audio-only icon and
@@ -58,6 +59,27 @@ transcode finished before playback starts.
 An `http(s)://` HLS URL is sent to the receiver as is, and a local `.m3u8` is served as
 a static directory.
 
+## DLNA
+
+Many TVs that support AirPlay also run a DLNA MediaRenderer. `--protocol dlna` uses it
+instead. Nothing needs to be paired; the TV is found over SSDP, controlled with SOAP
+`AVTransport` calls (`SetAVTransportURI`, `Play`, `Pause`, `Seek`, `Stop`), and then
+fetches the media over HTTP from this machine, using the same just-in-time HLS server.
+
+```sh
+pyatv-hls play movie.mkv --protocol dlna --host 192.168.1.50
+pyatv-hls play movie.mkv --protocol dlna --id "Living Room"       # part of its name
+pyatv-hls play movie.mkv --protocol dlna --location http://192.168.1.50:9197/dmr
+pyatv-hls play movie.mkv --protocol dlna --host 192.168.1.50 --direct
+```
+
+`--direct` serves the file unchanged, with HTTP Range support, instead of HLS. Use it if
+the renderer does not accept HLS; the file must then be in a format the TV plays itself.
+End of playback is detected by polling the transport state.
+
+> DLNA support is covered by tests against a mock renderer. It has **not yet been run on
+> real hardware**, and renderers differ in which media types they accept.
+
 ## Requirements
 
 - Python 3.9+
@@ -92,7 +114,10 @@ pyatv-hls play movie.mkv --id AA:BB:CC:DD:EE:FF --no-jit --workdir /tmp/hls
 
 | Option | Meaning |
 | --- | --- |
-| `--id` / `--host` | Receiver identifier or IP address (one is required) |
+| `--protocol` | `airplay` (default) or `dlna` |
+| `--id` / `--host` | Receiver identifier (AirPlay) or part of its name (DLNA), or its IP address. One of `--id`, `--host`, `--location` is required |
+| `--location URL` | DLNA only: the renderer's device description URL, skipping discovery |
+| `--direct` | DLNA only: serve the file unchanged instead of HLS |
 | `--start SECONDS` | Start position |
 | `--jit` / `--no-jit` | Convert as the receiver asks (default) or convert everything first |
 | `--workdir DIR` | Parent directory for `--no-jit` output (default: a temporary directory, removed afterwards) |
@@ -131,6 +156,18 @@ For the non-just-in-time mode, replace the server with
 
 Pass `on_event=callback` to `HlsPlayer` to receive the receiver's decoded events.
 
+For DLNA, `DlnaPlayer` has the same methods (`connect`, `play`, `pause`, `resume`, `stop`,
+`wait_until_ended`, `close`, `local_ip`):
+
+```python
+from pyatv_hls import DlnaPlayer, find_renderer
+
+player = DlnaPlayer(await find_renderer(host="192.168.1.50"))
+await player.connect()
+# serve media with JitHlsServer(media, player.local_ip) exactly as above
+await player.play(url, title="Movie")
+```
+
 ## Development
 
 ```sh
@@ -142,7 +179,8 @@ hardware). The HLS tests generate a tiny video with `ffmpeg` and are skipped wit
 
 ## Limitations
 
-- Tested on one receiver model. Others may differ.
+- AirPlay is tested on one receiver model, a Samsung UTU7000_KA. Others may differ.
+- DLNA is only tested against a mock renderer.
 - No seeking while playing yet (use `--start`), subtitles, multiple audio tracks, DRM or
   playlists.
 - Transcoding uses software `libx264`, so a high-bitrate source that needs it may not

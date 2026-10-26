@@ -121,6 +121,12 @@ class HlsPlayer:
         self._event_channel: Optional[EventChannel] = None
         self._keepalive: Optional["asyncio.Task[None]"] = None
 
+    @property
+    def local_ip(self) -> str:
+        """This machine's address as seen by the receiver."""
+        assert self.control is not None
+        return self.control.local_ip
+
     async def _verify(self, connection: HttpConnection) -> Any:
         if self._credentials is None:
             raise exceptions.InvalidCredentialsError("no AirPlay credentials")
