@@ -3,17 +3,39 @@
 An AirPlay 2 **HLS video sender** that extends [pyatv](https://github.com/postlund/pyatv).
 
 pyatv can stream audio (`stream_file`) and, on Apple TVs, play a URL (`play_url`).
-Some receivers, notably Samsung TVs, advertise AirPlay video **only as HLS** (the
-`VideoHTTPLiveStreams` feature bit is set and the plain `Video` bit is not). On those
-devices pyatv's `stream_file` shows an audio-only icon and `play_url` is rejected with
-`404` on `POST /play`. This package implements the HLS flow those receivers expect.
+Some receivers, notably Samsung TVs, advertise the HLS video feature bit
+(`VideoHTTPLiveStreams`) but not the plain `Video` bit. On those devices pyatv's
+`stream_file` shows an audio-only icon and `play_url` is rejected with `404` on
+`POST /play`. This package is an attempt to implement the AirPlay HLS flow that
+receivers like [UxPlay](https://github.com/FDH2/UxPlay) implement.
 
-> **Status: experimental.** The sender logic is covered by tests against a mock
-> receiver, but it has **not yet been verified against real hardware**. The protocol is
-> undocumented by Apple and was reconstructed from open-source receiver
-> implementations, so expect rough edges. Reports and captures are welcome.
+> **Status: experimental, and it does not work on the one TV it has been tried on.**
+> The sender logic passes tests against a mock receiver, but a real Samsung
+> UTU7000_KA (AirPlay SDK 3.3.0.54) rejects it, see [Findings](#findings). The
+> protocol is undocumented by Apple and was reconstructed from open-source *receiver*
+> code, so the sender side is partly guesswork. Reports and captures are welcome.
 
-## How it works
+## Findings
+
+Tested against a Samsung TU690T (model `UTU7000_KA`, AirPlay SDK 3.3.0.54) that plays
+video from the Airflow app:
+
+- Pair-verify with stored HAP credentials succeeds on both connections.
+- `GET /info` and `POST /feedback` work. `POST /command` returns `454 Session Not
+  Found`, and `400` once an RTSP `SETUP` session exists, so session routes are served.
+- `POST /reverse`, `/play`, `/action`, `/rate`, `/stop`, `/fp-setup` and
+  `GET /playback-info` all return **`404 Not Found`**, both before and after `SETUP`.
+  The HLS feature bit is advertised, but these routes are not served on this firmware
+  in the way this package (and UxPlay) expect.
+- While Airflow plays to the same TV it holds two TCP connections to it (the AirPlay
+  port plus one more port, likely the event channel) and **no UDP media stream**. The
+  TV in turn connects to an HTTP server run by Airflow on the sender and pulls the
+  media from there. So the TV does fetch media over HTTP; how it is told where to
+  fetch from is not yet known.
+
+Open question: what request makes this receiver start pulling from the sender.
+
+## Intended flow (as implemented, verified only against a mock)
 
 1. **Control connection**: pair-verify with your stored HAP credentials (reusing
    pyatv's auth and encryption).
@@ -102,6 +124,7 @@ The tests run an in-process mock receiver on loopback (no encryption, no hardwar
 - No FairPlay/DRM, subtitles, multiple audio tracks, or playlists.
 - Receivers that require extra setup steps before `/play` (for example `fp-setup`) are
   not handled yet.
+- Not working on the Samsung UTU7000_KA, see [Findings](#findings).
 
 ## Acknowledgements
 

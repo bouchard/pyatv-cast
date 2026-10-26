@@ -38,7 +38,7 @@ async def _find_device(args: argparse.Namespace):
     creds = args.credentials or settings.protocols.airplay.credentials
     if not creds:
         sys.exit("no AirPlay credentials; pair first: atvremote --protocol airplay pair")
-    return config.address, service.port, parse_credentials(creds)
+    return str(config.address), service.port, parse_credentials(creds)
 
 
 async def play(args: argparse.Namespace) -> None:
