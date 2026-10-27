@@ -8,7 +8,7 @@ import aiohttp
 import pytest
 from aiohttp import web
 
-from pyatv_hls import dlna
+from pyatv_cast import dlna
 
 REAL_LOCAL_ADDRESSES = dlna.local_addresses
 
@@ -368,3 +368,59 @@ async def test_play_ignores_a_failing_initial_stop(renderer):
     await player.play("http://x/a.mp4")
     assert [a for a, _ in renderer.actions][:3] == ["Stop", "SetAVTransportURI", "Play"]
     await player.close()
+
+
+async def test_discover_renderers_returns_each_one_found(renderer):
+    transport, _, target = await _responder(renderer.location)
+    try:
+        found = await dlna.discover_renderers(timeout=0.2, target=target)
+    finally:
+        transport.close()
+    assert [r.friendly_name for r in found] == ["[TV] Living Room"]
+
+
+async def test_sink_types_lists_what_the_renderer_plays(renderer):
+    renderer.sink = "http-get:*:video/mp4:*,http-get:*:VIDEO/x-mkv:DLNA.ORG_PN=X,http-get:*:*:*,broken"
+    player = await _player(renderer)
+    assert await player.sink_types() == {"video/mp4", "video/x-mkv"}
+    player.renderer.connection_url = None
+    assert await player.sink_types() == set()
+    await player.close()
+
+
+async def test_state_reads_the_transport_state(renderer):
+    renderer.states = ["PLAYING"]
+    player = await _player(renderer)
+    assert await player.state() == "PLAYING"
+    await player.close()
+
+
+async def test_upnp_error_code_is_kept_on_the_exception(renderer):
+    renderer.fail["Pause"] = 500
+    player = await _player(renderer)
+    with pytest.raises(dlna.DlnaError) as info:
+        await player.pause()
+    assert info.value.code == 701
+    await player.close()
+    assert dlna.DlnaError("plain").code is None
+    assert dlna._upnp_code("not xml") is None
+
+
+def test_didl_uses_the_given_flags():
+    text = dlna.didl("http://h/a.ts", "T", "video/mpeg", flags="DLNA.ORG_OP=00")
+    assert "http-get:*:video/mpeg:DLNA.ORG_OP=00" in text
+
+
+async def test_direct_server_counts_what_the_renderer_asks_for(tmp_path):
+    media = tmp_path / "movie.mp4"
+    media.write_bytes(b"x")
+    server = dlna.DirectFileServer(media, "127.0.0.1")
+    url = await server.start()
+    assert server.requests == 0
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.get(url) as resp:
+                await resp.read()
+        assert server.requests == 1
+    finally:
+        await server.stop()

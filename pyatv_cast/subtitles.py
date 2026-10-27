@@ -9,11 +9,12 @@ HLS carries subtitles as WebVTT; DLNA renderers (Samsung) fetch an SRT file.
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from pyatv_hls import hls
+from pyatv_cast import hls
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,9 +40,13 @@ class Subtitle:
         """The subtitle as WebVTT."""
         return await self._convert("webvtt")
 
-    async def srt(self) -> bytes:
-        """The subtitle as SRT."""
-        return await self._convert("srt")
+    async def srt(self, offset: float = 0.0) -> bytes:
+        """The subtitle as SRT, with the first ``offset`` seconds cut off.
+
+        Used when playback starts part way in and the stream's clock starts at zero.
+        """
+        data = await self._convert("srt")
+        return shift_srt(data, offset) if offset > 0 else data
 
     async def _convert(self, fmt: str) -> bytes:
         if fmt not in self._cache:
@@ -58,6 +63,31 @@ class Subtitle:
                     "-map", f"0:s:{self.stream_index}", "-f", fmt, "pipe:1",
                 )  # fmt: skip
         return self._cache[fmt]
+
+
+_CUE_TIME = re.compile(r"(\d+):(\d\d):(\d\d)[,.](\d{3}) --> (\d+):(\d\d):(\d\d)[,.](\d{3})")
+
+
+def _stamp(seconds: float) -> str:
+    millis = round(seconds * 1000)
+    return f"{millis // 3_600_000:02d}:{millis // 60_000 % 60:02d}:{millis // 1000 % 60:02d},{millis % 1000:03d}"
+
+
+def shift_srt(data: bytes, offset: float) -> bytes:
+    """Move every cue ``offset`` seconds earlier, dropping cues that end before zero."""
+    out = []
+    for block in data.decode("utf-8", errors="replace").replace("\r\n", "\n").split("\n\n"):
+        lines = block.strip().split("\n")
+        timing = next((i for i, line in enumerate(lines) if _CUE_TIME.search(line)), None)
+        if timing is None:
+            continue
+        h1, m1, s1, ms1, h2, m2, s2, ms2 = (int(g) for g in _CUE_TIME.search(lines[timing]).groups())
+        start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000 - offset
+        end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000 - offset
+        if end <= 0:
+            continue
+        out.append(f"{len(out) + 1}\n{_stamp(max(start, 0))} --> {_stamp(end)}\n" + "\n".join(lines[timing + 1:]))
+    return ("\n\n".join(out) + "\n\n").encode() if out else b""
 
 
 def _decode(raw: bytes) -> str:
@@ -120,7 +150,10 @@ async def find(video: Path, explicit: Optional[Path] = None) -> Optional[Subtitl
         return Subtitle("", _display(""), sidecar=explicit)
     chosen = _prefer_english(sidecars(video))
     if chosen is None:
-        chosen = _prefer_english(embedded(video, await hls.probe(video)))
+        try:
+            chosen = _prefer_english(embedded(video, await hls.probe(video)))
+        except RuntimeError as ex:  # not something ffprobe can read: just no subtitles
+            _LOGGER.debug("no embedded subtitles in %s: %s", video, ex)
     if chosen is not None:
         _LOGGER.info("subtitles: %s (%s)", chosen.name, chosen.sidecar or "embedded")
     return chosen

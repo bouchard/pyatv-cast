@@ -47,7 +47,7 @@ SecureFunc = Callable[[HttpConnection], Awaitable[Any]]
 EventFunc = Callable[[Dict[str, Any]], None]
 
 
-class HlsPlaybackError(exceptions.PlaybackError):
+class AirPlayError(exceptions.PlaybackError):
     """Raised when the receiver rejects or aborts HLS playback."""
 
 
@@ -94,7 +94,7 @@ def _make_event_channel(callback: Optional[EventFunc]):
     return _Channel
 
 
-class HlsPlayer:
+class AirPlayPlayer:
     """Plays an HLS playlist URL on an AirPlay 2 receiver."""
 
     def __init__(
@@ -104,9 +104,9 @@ class HlsPlayer:
         credentials: Optional[HapCredentials] = None,
         secure: Optional[SecureFunc] = None,
         on_event: Optional[EventFunc] = None,
-        name: str = "pyatv-hls",
+        name: str = "pyatv-cast",
     ) -> None:
-        """Initialize a new HlsPlayer."""
+        """Initialize a new AirPlayPlayer."""
         self._address = address
         self._port = port
         self._credentials = credentials
@@ -146,7 +146,7 @@ class HlsPlayer:
                 "deviceID": "02:00:00:00:00:01",
                 "groupContainsGroupLeader": False,
                 "groupUUID": str(uuid4()),
-                "model": "pyatv-hls",
+                "model": "pyatv-cast",
                 "name": self._name,
                 "senderSupportsRelay": True,
                 "sessionUUID": "00000000-0000-0000-0000-000000000000",
@@ -156,7 +156,7 @@ class HlsPlayer:
         info = _body(resp)
         if verifier is not None:
             if "eventPort" not in info:
-                raise HlsPlaybackError("SETUP response missing event port")
+                raise AirPlayError("SETUP response missing event port")
             _, self._event_channel = await setup_channel(
                 _make_event_channel(self._event),
                 verifier,
@@ -184,7 +184,7 @@ class HlsPlayer:
         )
         streams = _body(resp).get("streams") or []
         if not streams or "streamID" not in streams[0]:
-            raise HlsPlaybackError("SETUP did not return a stream")
+            raise AirPlayError("SETUP did not return a stream")
         self.stream_id = str(streams[0]["streamID"])
         self._keepalive = asyncio.ensure_future(self._keepalive_loop())
 
@@ -286,7 +286,7 @@ class HlsPlayer:
             method, uri=uri, headers=headers, body=body, allow_error=True
         )
         if resp.code != 200:
-            raise HlsPlaybackError(
+            raise AirPlayError(
                 f"{method} {uri or ''} refused: {resp.code} {resp.message}"
             )
         return resp
@@ -296,7 +296,7 @@ class HlsPlayer:
             await asyncio.sleep(KEEPALIVE_INTERVAL)
             try:
                 await self._rtsp("POST", uri="/feedback")
-            except (exceptions.ConnectionLostError, TimeoutError, HlsPlaybackError):
+            except (exceptions.ConnectionLostError, TimeoutError, AirPlayError):
                 _LOGGER.debug("keepalive failed; stopping it")
                 self.ended.set()
                 return

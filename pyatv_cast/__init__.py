@@ -1,21 +1,21 @@
 """AirPlay 2 HLS sender extension for pyatv."""
 
-from pyatv_hls.dlna import DirectFileServer, DlnaError, DlnaPlayer, find_renderer
-from pyatv_hls.hls import (
+from pyatv_cast.dlna import DirectFileServer, DlnaError, DlnaPlayer, find_renderer
+from pyatv_cast.hls import (
     JitHlsServer,
     MediaPlan,
     StaticHlsServer,
     convert_to_directory,
     plan,
 )
-from pyatv_hls.session import HlsPlaybackError, HlsPlayer
+from pyatv_cast.airplay import AirPlayError, AirPlayPlayer
 
 __all__ = [
     "DirectFileServer",
     "DlnaError",
     "DlnaPlayer",
-    "HlsPlayer",
-    "HlsPlaybackError",
+    "AirPlayPlayer",
+    "AirPlayError",
     "JitHlsServer",
     "MediaPlan",
     "StaticHlsServer",

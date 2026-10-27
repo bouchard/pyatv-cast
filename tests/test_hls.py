@@ -8,7 +8,7 @@ from pathlib import Path
 import aiohttp
 import pytest
 
-from pyatv_hls import hls
+from pyatv_cast import hls
 
 needs_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None, reason="ffmpeg not installed"
@@ -226,6 +226,24 @@ async def test_static_server_serves_directory(tmp_path):
         async with aiohttp.ClientSession() as http:
             async with http.get(url.replace("index.m3u8", "seg0.ts")) as resp:
                 assert await resp.read() == b"data"
+                assert resp.headers["Content-Type"] == "video/mp2t"
+                assert resp.headers["Cache-Control"] == "no-cache"
+            async with http.get(url) as resp:
+                assert resp.headers["Content-Type"].startswith("application/vnd.apple.mpegurl")
+            async with http.get(url.replace("index.m3u8", "missing.ts")) as resp:
+                assert resp.status == 404
+            async with http.get(url.replace("index.m3u8", "%2e%2e/secret")) as resp:
+                assert resp.status == 404
     finally:
         await server.stop()
     await server.stop()  # second stop is harmless
+
+    (tmp_path / "other.bin").write_bytes(b"x")
+    plain = hls.StaticHlsServer(tmp_path / "index.m3u8", "127.0.0.1")
+    other = (await plain.start()).replace("index.m3u8", "other.bin")
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.get(other) as resp:
+                assert "Cache-Control" not in resp.headers
+    finally:
+        await plain.stop()

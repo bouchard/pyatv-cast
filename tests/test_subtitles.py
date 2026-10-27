@@ -7,8 +7,7 @@ from pathlib import Path
 import aiohttp
 import pytest
 
-from pyatv_hls import cli, dlna, hls, subtitles
-from tests.test_cli import _args
+from pyatv_cast import dlna, hls, subtitles
 from tests.test_hls import _make_video
 
 needs_ffmpeg = pytest.mark.skipif(
@@ -257,45 +256,35 @@ async def test_direct_server_without_subtitle_has_no_caption_header(tmp_path):
 
 
 @needs_ffmpeg
-@pytest.mark.parametrize("direct", [False, True])
-async def test_cli_serves_the_sidecar_subtitle(tmp_path, direct):
-    source = tmp_path / "Movie.mkv"
-    _make_video(source, "libx264", "aac")
-    (tmp_path / "Movie.srt").write_text(SRT.replace("Café", "Cafe"))
-    served = await cli._serve(_args(source=str(source), direct=direct), "127.0.0.1", None)
-    try:
-        assert (served.subtitle_url is not None) is direct
-        assert served.url.endswith("/media.mkv" if direct else "/master.m3u8")
-    finally:
-        await served.server.stop()
+async def test_srt_can_skip_the_first_seconds(tmp_path):
+    srt = tmp_path / "Movie.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nEarly\n\n2\n00:00:12,000 --> 00:00:13,000\nLater\n\n")
+    sub = subtitles.Subtitle("", "", sidecar=srt)
+    shifted = (await sub.srt(10.0)).decode()
+    assert "Later" in shifted and "00:00:02,000 --> 00:00:03,000" in shifted
+    assert "Early" not in shifted
 
 
-@needs_ffmpeg
-async def test_cli_can_turn_subtitles_off_or_name_a_file(tmp_path):
-    source = tmp_path / "Movie.mkv"
-    _make_video(source, "libx264", "aac")
-    (tmp_path / "Movie.srt").write_text(SRT.replace("Café", "Cafe"))
-    off = await cli._serve(_args(source=str(source), no_subtitles=True), "127.0.0.1", None)
-    named = await cli._serve(
-        _args(source=str(source), subtitles=str(tmp_path / "Movie.srt")), "127.0.0.1", None
+def test_shift_srt_moves_clamps_and_drops_cues():
+    data = (
+        "1\n00:00:01,000 --> 00:00:03,000\nGone\n\n"
+        "2\n00:00:08,000 --> 00:00:12,500\nPartly gone\nsecond line\n\n"
+        "3\n00:01:10,250 --> 00:01:11,000\nKept\n\n"
+    ).encode()
+    shifted = subtitles.shift_srt(data, 10.0).decode()
+    assert shifted == (
+        "1\n00:00:00,000 --> 00:00:02,500\nPartly gone\nsecond line\n\n"
+        "2\n00:01:00,250 --> 00:01:01,000\nKept\n\n"
     )
-    try:
-        assert off.url.endswith("/index.m3u8") and named.url.endswith("/master.m3u8")
-    finally:
-        await off.server.stop()
-        await named.server.stop()
+    assert subtitles.shift_srt(data, 10000) == b""
+    assert subtitles.shift_srt(b"WEBVTT garbage with no cues", 1) == b""
 
 
-async def test_cli_reports_a_missing_subtitle_file(tmp_path):
-    source = _touch(tmp_path, "Movie.mkv")
-    with pytest.raises(SystemExit, match="subtitle file not found"):
-        await cli._serve(_args(source=str(source), subtitles=str(tmp_path / "nope.srt")), "127.0.0.1", None)
+async def test_unreadable_file_just_means_no_subtitles(tmp_path, monkeypatch):
+    video = _touch(tmp_path, "Movie.mkv")
 
+    async def fails(path):
+        raise RuntimeError("ffprobe failed: Invalid data")
 
-def test_cli_rejects_both_subtitle_flags(monkeypatch, capsys):
-    import sys
-
-    monkeypatch.setattr(sys, "argv", ["pyatv-hls", "play", "m.mkv", "--id", "x", "--subtitles", "a.srt", "--no-subtitles"])
-    with pytest.raises(SystemExit):
-        cli.main()
-    assert "cannot be used together" in capsys.readouterr().err
+    monkeypatch.setattr(hls, "probe", fails)
+    assert await subtitles.find(video) is None

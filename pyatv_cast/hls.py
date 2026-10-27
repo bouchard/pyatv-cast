@@ -50,7 +50,7 @@ class MediaPlan:
     bandwidth: int = 8_000_000
     resolution: Optional[str] = None
     codecs: Optional[str] = None  # only known when the streams are copied as they are
-    subtitle: Optional[Any] = None  # a pyatv_hls.subtitles.Subtitle
+    subtitle: Optional[Any] = None  # a pyatv_cast.subtitles.Subtitle
     # Added to every segment's timestamps. The first video packet has a negative decode
     # time, which the muxer would otherwise shift for segment 0 only.
     ts_shift: float = 0.0
@@ -202,7 +202,7 @@ def _pick_audio(streams: List[dict]) -> Tuple[Optional[dict], int]:
 async def plan(source: Path, subtitle: Optional[Any] = None) -> MediaPlan:
     """Probe ``source`` and decide what has to be converted.
 
-    ``subtitle`` is an optional :class:`pyatv_hls.subtitles.Subtitle` to offer with it.
+    ``subtitle`` is an optional :class:`pyatv_cast.subtitles.Subtitle` to offer with it.
     """
     info = await probe(source)
     video = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
@@ -291,6 +291,7 @@ class JitHlsServer:
         self._inflight: dict = {}
         self._slots = asyncio.Semaphore(MAX_FFMPEG)
         self._runner: Optional[web.AppRunner] = None
+        self.requests = 0  # what the renderer asked for: 0 means it never connected
 
     async def _segment_bytes(self, index: int) -> bytes:
         if index in self._cache:
@@ -344,7 +345,13 @@ class JitHlsServer:
 
     async def start(self) -> str:
         """Start serving and return the playlist URL."""
-        app = web.Application(middlewares=[_log_requests])
+
+        @web.middleware
+        async def count(request: web.Request, handler):
+            self.requests += 1
+            return await _log_requests(request, handler)
+
+        app = web.Application(middlewares=[count])
         app.router.add_get(f"/{PLAYLIST_NAME}", self._playlist)
         if self._media.subtitle:
             app.router.add_get(f"/{MASTER_NAME}", self._master)
@@ -401,10 +408,19 @@ class StaticHlsServer:
         self._port = port
         self._runner: Optional[web.AppRunner] = None
 
+    async def _serve(self, request: web.Request) -> web.StreamResponse:
+        root = self._playlist.parent.resolve()
+        path = (root / request.match_info["name"]).resolve()
+        if root not in path.parents or not path.is_file():
+            raise web.HTTPNotFound()
+        kind = {".m3u8": "application/vnd.apple.mpegurl", ".ts": "video/mp2t"}.get(path.suffix)
+        headers = {"Cache-Control": "no-cache"} if kind else {}
+        return web.FileResponse(path, headers={**headers, **({"Content-Type": kind} if kind else {})})
+
     async def start(self) -> str:
         """Start serving and return the playlist URL."""
         app = web.Application()
-        app.router.add_static("/", self._playlist.parent, follow_symlinks=False)
+        app.router.add_get("/{name:.+}", self._serve)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self._address, self._port)

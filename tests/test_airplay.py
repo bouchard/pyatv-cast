@@ -9,8 +9,8 @@ import pytest
 from pyatv import exceptions
 from pyatv.support.http import HttpRequest, format_request
 
-from pyatv_hls import session
-from pyatv_hls.session import HlsPlaybackError, HlsPlayer
+from pyatv_cast import airplay
+from pyatv_cast.airplay import AirPlayError, AirPlayPlayer
 
 
 async def _read_message(reader: asyncio.StreamReader):
@@ -84,10 +84,10 @@ async def receiver():
 
 async def test_full_flow(receiver, monkeypatch):
     mock, port = receiver
-    monkeypatch.setattr(session, "KEEPALIVE_INTERVAL", 0.05)
+    monkeypatch.setattr(airplay, "KEEPALIVE_INTERVAL", 0.05)
     events = []
 
-    player = HlsPlayer("127.0.0.1", port, secure=_no_verify, on_event=events.append)
+    player = AirPlayPlayer("127.0.0.1", port, secure=_no_verify, on_event=events.append)
     await player.connect()
     await player.play("http://10.0.0.2:9000/index.m3u8", title="Movie", start=90.0)
     await player.pause()
@@ -109,7 +109,7 @@ async def test_full_flow(receiver, monkeypatch):
     insert, rate_on, rate_off, remove = (c for _, c in commands)
     assert insert["type"] == "insertPlayQueueItem"
     assert insert["item"]["Content-Location"] == "http://10.0.0.2:9000/index.m3u8"
-    assert insert["item"]["Start-Position"]["value"] == 90 * session.CM_TIMESCALE
+    assert insert["item"]["Start-Position"]["value"] == 90 * airplay.CM_TIMESCALE
     assert insert["metadata"]["Title"] == "Movie"
     assert (rate_on["type"], rate_on["rate"]) == ("setRate", 1.0)
     assert (rate_off["type"], rate_off["rate"]) == ("setRate", 0.0)
@@ -122,7 +122,7 @@ async def test_full_flow(receiver, monkeypatch):
 
 async def test_item_played_to_end_event(receiver):
     mock, port = receiver
-    player = HlsPlayer("127.0.0.1", port, secure=_no_verify)
+    player = AirPlayPlayer("127.0.0.1", port, secure=_no_verify)
     await player.connect()
     assert not player.ended.is_set()
     player._event({"params": {"type": "itemPlayedToEnd"}})
@@ -133,8 +133,8 @@ async def test_item_played_to_end_event(receiver):
 async def test_stream_setup_refused():
     mock = MockReceiver(stream_code=400)
     port = await mock.start()
-    player = HlsPlayer("127.0.0.1", port, secure=_no_verify)
-    with pytest.raises(HlsPlaybackError, match="400"):
+    player = AirPlayPlayer("127.0.0.1", port, secure=_no_verify)
+    with pytest.raises(AirPlayError, match="400"):
         await player.connect()
     await player.close()
     mock.server.close()
@@ -143,7 +143,7 @@ async def test_stream_setup_refused():
 def test_decode_unwraps_nested_plists():
     inner = plistlib.dumps({"name": "playbackState"}, fmt=plistlib.FMT_BINARY)
     event = {"params": {"data": inner, "list": [inner]}, "bad": b"bplist00garbage"}
-    decoded = session._decode(event)
+    decoded = airplay._decode(event)
     assert decoded["params"]["data"] == {"name": "playbackState"}
     assert decoded["params"]["list"] == [{"name": "playbackState"}]
     assert decoded["bad"] == b"bplist00garbage"
@@ -158,7 +158,7 @@ def _event_request(body: bytes) -> bytes:
 
 
 def _channel(callback):
-    channel = session._make_event_channel(callback)(bytes(32), bytes(32))
+    channel = airplay._make_event_channel(callback)(bytes(32), bytes(32))
     channel.transport = Mock()
     channel.send = Mock()
     return channel
@@ -199,12 +199,12 @@ async def test_connect_sets_up_the_event_channel(receiver, monkeypatch):
         opened.append((verifier, address, event_port, salts))
         return None, channel
 
-    monkeypatch.setattr(session, "setup_channel", fake_setup_channel)
+    monkeypatch.setattr(airplay, "setup_channel", fake_setup_channel)
 
     async def verify(connection):
         return "verifier"
 
-    player = HlsPlayer("127.0.0.1", port, secure=verify)
+    player = AirPlayPlayer("127.0.0.1", port, secure=verify)
     await player.connect()
     assert opened[0][0] == "verifier" and opened[0][2] == 1
     await player.close()
@@ -218,15 +218,15 @@ async def test_connect_requires_an_event_port():
     async def verify(connection):
         return "verifier"
 
-    player = HlsPlayer("127.0.0.1", port, secure=verify)
-    with pytest.raises(HlsPlaybackError, match="event port"):
+    player = AirPlayPlayer("127.0.0.1", port, secure=verify)
+    with pytest.raises(AirPlayError, match="event port"):
         await player.connect()
     await player.close()
     mock.server.close()
 
 
 async def test_default_verify_needs_credentials():
-    player = HlsPlayer("127.0.0.1", 1)
+    player = AirPlayPlayer("127.0.0.1", 1)
     with pytest.raises(exceptions.InvalidCredentialsError):
         await player._verify(Mock())
 
@@ -238,17 +238,17 @@ async def test_default_verify_uses_stored_credentials(monkeypatch):
         seen.append((credentials, connection))
         return "verifier"
 
-    monkeypatch.setattr(session, "verify_connection", fake_verify)
-    player = HlsPlayer("127.0.0.1", 1, credentials="creds")
+    monkeypatch.setattr(airplay, "verify_connection", fake_verify)
+    player = AirPlayPlayer("127.0.0.1", 1, credentials="creds")
     assert await player._verify("conn") == "verifier"
     assert seen == [("creds", "conn")]
 
 
 async def test_stop_before_connect_and_after_connection_loss(receiver):
     mock, port = receiver
-    await HlsPlayer("127.0.0.1", 1).stop()  # never connected: nothing to do
+    await AirPlayPlayer("127.0.0.1", 1).stop()  # never connected: nothing to do
 
-    player = HlsPlayer("127.0.0.1", port, secure=_no_verify)
+    player = AirPlayPlayer("127.0.0.1", port, secure=_no_verify)
     await player.connect()
     player.item_uuid = "abc"
 
@@ -263,8 +263,8 @@ async def test_stop_before_connect_and_after_connection_loss(receiver):
 
 async def test_keepalive_failure_ends_playback(receiver, monkeypatch):
     mock, port = receiver
-    monkeypatch.setattr(session, "KEEPALIVE_INTERVAL", 0.01)
-    player = HlsPlayer("127.0.0.1", port, secure=_no_verify)
+    monkeypatch.setattr(airplay, "KEEPALIVE_INTERVAL", 0.01)
+    player = AirPlayPlayer("127.0.0.1", port, secure=_no_verify)
     await player.connect()
 
     async def failing(*args, **kwargs):
@@ -278,6 +278,6 @@ async def test_keepalive_failure_ends_playback(receiver, monkeypatch):
 async def test_events_reach_the_callback(receiver):
     mock, port = receiver
     events = []
-    player = HlsPlayer("127.0.0.1", port, secure=_no_verify, on_event=events.append)
+    player = AirPlayPlayer("127.0.0.1", port, secure=_no_verify, on_event=events.append)
     player._event({"name": "playing"})
     assert events == [{"name": "playing"}] and not player.ended.is_set()

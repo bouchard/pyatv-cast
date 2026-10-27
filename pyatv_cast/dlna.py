@@ -11,7 +11,7 @@ import logging
 import mimetypes
 import socket
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 from xml.sax.saxutils import escape
 
@@ -36,7 +36,15 @@ _FLAGS = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000
 
 
 class DlnaError(Exception):
-    """Raised when the renderer rejects a request or cannot be found."""
+    """Raised when the renderer rejects a request or cannot be found.
+
+    ``code`` is the UPnP error code when the renderer sent one.
+    """
+
+    def __init__(self, message: str, code: Optional[int] = None) -> None:
+        """Initialize a new DlnaError."""
+        super().__init__(message)
+        self.code = code
 
 
 class Renderer:
@@ -161,6 +169,16 @@ async def _fetch(http: aiohttp.ClientSession, location: str) -> Optional[Rendere
         return None
 
 
+async def discover_renderers(
+    timeout: float = 3.0, target: Tuple[str, int] = SSDP_GROUP
+) -> List[Renderer]:
+    """Find every MediaRenderer on the network."""
+    locations = await ssdp_search(timeout, target)
+    async with aiohttp.ClientSession() as http:
+        found = [await _fetch(http, location) for location in locations]
+    return [renderer for renderer in found if renderer]
+
+
 async def find_renderer(
     host: Optional[str] = None,
     name: Optional[str] = None,
@@ -183,7 +201,9 @@ async def find_renderer(
     raise DlnaError(f"no matching DLNA renderer found; saw: {seen}")
 
 
-def didl(url: str, title: str, mime: str, subtitle_url: Optional[str] = None) -> str:
+def didl(
+    url: str, title: str, mime: str, subtitle_url: Optional[str] = None, flags: str = _FLAGS
+) -> str:
     """Build the DIDL-Lite metadata describing the item.
 
     A subtitle is announced the way Samsung renderers read it (``sec:CaptionInfoEx``)
@@ -203,7 +223,7 @@ def didl(url: str, title: str, mime: str, subtitle_url: Optional[str] = None) ->
         '<item id="0" parentID="-1" restricted="1">'
         f"<dc:title>{escape(title)}</dc:title>"
         "<upnp:class>object.item.videoItem</upnp:class>"
-        f'<res protocolInfo="http-get:*:{mime}:{_FLAGS}">{escape(url)}</res>'
+        f'<res protocolInfo="http-get:*:{mime}:{flags}">{escape(url)}</res>'
         f"{caption}</item></DIDL-Lite>"
     )
 
@@ -215,12 +235,18 @@ def clock(seconds: float) -> str:
 
 
 class DlnaPlayer:
-    """Plays a URL on a DLNA MediaRenderer. Same interface as :class:`HlsPlayer`."""
+    """Plays a URL on a DLNA MediaRenderer. Same interface as :class:`AirPlayPlayer`."""
 
-    def __init__(self, renderer: Renderer, mime: str = "application/vnd.apple.mpegurl"):
+    def __init__(
+        self,
+        renderer: Renderer,
+        mime: str = "application/vnd.apple.mpegurl",
+        flags: str = _FLAGS,
+    ):
         """Initialize a new DlnaPlayer."""
         self.renderer = renderer
         self.mime = mime
+        self.flags = flags
         self.ended = asyncio.Event()
         self._http: Optional[aiohttp.ClientSession] = None
         self._poll: Optional["asyncio.Task[None]"] = None
@@ -228,13 +254,13 @@ class DlnaPlayer:
 
     async def connect(self) -> None:
         """Open the HTTP session and work out which local address reaches the renderer."""
-        self._http = aiohttp.ClientSession()
         probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             probe.connect((self.renderer.host, 9))  # no packet is sent
             self.local_ip = probe.getsockname()[0]
         finally:
             probe.close()
+        self._http = aiohttp.ClientSession()
 
     async def close(self) -> None:
         """Stop polling and close the HTTP session."""
@@ -264,7 +290,7 @@ class DlnaPlayer:
         await self._action(
             "SetAVTransportURI",
             CurrentURI=escape(url),
-            CurrentURIMetaData=escape(didl(url, title, self.mime, subtitle_url)),
+            CurrentURIMetaData=escape(didl(url, title, self.mime, subtitle_url, self.flags)),
         )
         await self._action("Play", Speed="1")
         self._poll = asyncio.ensure_future(self._poll_state())
@@ -295,21 +321,31 @@ class DlnaPlayer:
 
     # -- internals --------------------------------------------------------
 
-    async def supports_hls(self) -> bool:
-        """Ask the renderer whether it lists an HLS media type among what it can play.
-
-        When it cannot say, assume it cannot: plain files are the safer choice.
-        """
+    async def sink_types(self) -> Set[str]:
+        """The media types the renderer says it can play (empty if it cannot say)."""
         if not self.renderer.connection_url:
-            return False
+            return set()
         try:
             info = await self._action(
                 "GetProtocolInfo", service=CONNECTION_MANAGER,
                 url=self.renderer.connection_url, instance=False,
             )  # fmt: skip
         except (DlnaError, aiohttp.ClientError, asyncio.TimeoutError):
-            return False
-        return "mpegurl" in info.get("Sink", "").lower()
+            return set()
+        types = set()
+        for entry in info.get("Sink", "").split(","):
+            fields = entry.split(":")
+            if len(fields) >= 3 and fields[2] not in ("", "*"):
+                types.add(fields[2].strip().lower())
+        return types
+
+    async def supports_hls(self) -> bool:
+        """Whether the renderer lists an HLS media type among what it can play."""
+        return any("mpegurl" in mime for mime in await self.sink_types())
+
+    async def state(self) -> str:
+        """The renderer's transport state, e.g. PLAYING or TRANSITIONING."""
+        return await self._state()
 
     async def _action(
         self,
@@ -340,7 +376,10 @@ class DlnaPlayer:
         ) as resp:  # fmt: skip
             text = await resp.text()
             if resp.status != 200:
-                raise DlnaError(f"{name} failed: HTTP {resp.status} {_upnp_error(text)}")
+                raise DlnaError(
+                    f"{name} failed: HTTP {resp.status} {_upnp_error(text)}",
+                    _upnp_code(text),
+                )
         reply = ET.fromstring(text).find(".//{%s}%sResponse" % (service, name))
         return {child.tag.split("}")[-1]: child.text or "" for child in (reply or [])}
 
@@ -410,8 +449,10 @@ class DirectFileServer:
         self._srt = b""
         self._runner: Optional[web.AppRunner] = None
         self.subtitle_url: Optional[str] = None
+        self.requests = 0  # what the renderer asked for: 0 means it never connected
 
     async def _serve(self, request: web.Request) -> web.StreamResponse:
+        self.requests += 1
         _LOGGER.debug(
             "%s %s from %s headers=%s", request.method, request.path, request.remote,
             dict(request.headers),
@@ -453,3 +494,11 @@ class DirectFileServer:
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+
+
+def _upnp_code(text: str) -> Optional[int]:
+    try:
+        code = ET.fromstring(text).findtext(".//{urn:schemas-upnp-org:control-1-0}errorCode")
+        return int(code) if code else None
+    except (ET.ParseError, ValueError):
+        return None

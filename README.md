@@ -1,224 +1,250 @@
-# pyatv-hls
+# pyatv-cast
 
-An AirPlay 2 **video sender** that extends [pyatv](https://github.com/postlund/pyatv).
-It plays a video file (or an HLS URL) on AirPlay 2 receivers that pull HLS over HTTP,
-and converts the file to HLS **just in time**, so nothing is written to disk. It can
-also send to **DLNA** (UPnP MediaRenderer) TVs as an alternative, see [DLNA](#dlna).
-
-pyatv can stream audio (`stream_file`) and, on Apple TVs, play a URL (`play_url`). On
-some receivers, notably Samsung TVs, `stream_file` shows an audio-only icon and
-`play_url` is rejected with `404` on `POST /play`. Those receivers use a different
-flow, the one Apple's own senders and apps such as Airflow use. This package
-implements it.
-
-> **Status: works on one receiver, a Samsung UTU7000_KA (AirPlay SDK 3.3.0.54).** The
-> protocol is undocumented. It was reconstructed by capturing what a commercial sender
-> sends to a fake receiver, so other receivers may need changes. Reports and captures
-> are welcome.
-
-## How it works
-
-Everything runs over one HAP-encrypted RTSP connection, using pyatv's pairing and
-crypto:
-
-1. `pair-verify` with your stored credentials.
-2. `SETUP` (session), connect the encrypted **event channel** it announces, `RECORD`,
-   `GET /info`.
-3. `SETUP` with a stream of `type` 130; the receiver returns a `streamID`.
-4. `POST /command` with header `X-Apple-StreamID`. The body is
-   `{"params": {"data": <binary plist>}}`, and the inner plist is an
-   `insertPlayQueueItem` whose `Content-Location` is a plain `http://` HLS playlist,
-   followed by `setRate`.
-5. The receiver fetches the playlist and segments itself over HTTP from this machine.
-   `POST /feedback` every 2 s keeps the session alive, and the event channel reports
-   `playbackState`, `timeJumped`, `itemPlayedToEnd` and so on.
-6. `removePlayQueueItem` and `TEARDOWN` end it.
-
-There is no `/play`, `/reverse` or FairPlay step on these receivers.
-
-### Just-in-time HLS (on by default)
-
-Given a video file, the package probes it once, lists its keyframes (about a second for
-a 100-minute film) and builds a complete VOD playlist. Each `.ts` segment is made by
-`ffmpeg` only when the receiver requests it, so playback starts at once, seeking is
-instant and there are no temporary files.
-
-Turn it off with `--no-jit` (CLI) or by calling `convert_to_directory()` (library). The
-whole file is then converted to a directory first, with exactly the same segments, and
-served as static files. Use that when you want the files kept (`--workdir`) or a slow
-transcode finished before playback starts.
-
-- H.264 video and AAC audio are **copied** (a remux, no quality loss, about 0.06 s per
-  segment).
-- Anything else is transcoded, **only the stream that needs it**: other video codecs or
-  10-bit video go to H.264, other audio (AC-3, DTS, ...) goes to stereo AAC.
-- Segments are cut just before the next keyframe's decode time, and all timestamps are
-  shifted together, so neighbouring segments neither overlap nor leave gaps.
-- An English audio track is preferred, otherwise the first.
-
-An `http(s)://` HLS URL is sent to the receiver as is, and a local `.m3u8` is served as
-a static directory.
-
-## Subtitles
-
-A subtitle is picked automatically, in this order, preferring English at each step:
-
-1. a file you name with `--subtitles FILE` (`.srt` or `.vtt`)
-2. a sidecar file next to the video whose name starts with the video's name
-   (`Movie.srt`, `Movie.en.srt`, ...)
-3. a text track inside the video (SRT, ASS, `mov_text`, WebVTT; picture-based tracks
-   such as PGS are skipped)
-
-Use `--no-subtitles` to send none. Files in Windows-1252 are converted to UTF-8, and
-everything is converted in memory by ffmpeg, so nothing is written to disk.
-
-- **AirPlay** gets the subtitle as a WebVTT track in a master playlist. The receiver only
-  downloads it once the track is **selected on the TV** (use the TV's own subtitle or
-  caption menu during playback). The track is offered as the default, but the Samsung
-  tested does not select it by itself.
-- **DLNA** gets the subtitle as an SRT file announced the way Samsung renderers read it
-  (a `CaptionInfo.sec` response header and `sec:CaptionInfoEx` metadata), plus a
-  `text/srt` resource for other renderers. This works with `--direct` and the default
-  direct mode for renderers without HLS.
-
-Subtitles are not burned into the picture: that needs an ffmpeg built with libass, which
-many builds (Homebrew's included) lack.
-
-## DLNA
-
-Many TVs that support AirPlay also run a DLNA MediaRenderer. `--protocol dlna` uses it
-instead. Nothing needs to be paired; the TV is found over SSDP, controlled with SOAP
-`AVTransport` calls (`SetAVTransportURI`, `Play`, `Pause`, `Seek`, `Stop`), and then
-fetches the media over HTTP from this machine. If the renderer lists HLS among what it
-plays, the same just-in-time HLS server is used; otherwise the file is sent unchanged.
+Play a video file or a web video on your TV, with one command:
 
 ```sh
-pyatv-hls play movie.mkv --protocol dlna --host 192.168.1.50
-pyatv-hls play movie.mkv --protocol dlna --id "Living Room"       # part of its name
-pyatv-hls play movie.mkv --protocol dlna --location http://192.168.1.50:9197/dmr
-pyatv-hls play movie.mkv --protocol dlna --host 192.168.1.50 --direct
+pyatv-cast movie.mkv
+pyatv-cast https://www.youtube.com/watch?v=VIDEO
+pyatv-cast movie.mkv --start 600          # begin ten minutes in
 ```
 
-The CLI asks the renderer what it plays and picks for you. `--direct` serves the file
-unchanged, with HTTP Range support, instead of HLS, and `--no-direct` forces HLS. In
-direct mode the file must be in a format the TV plays itself.
-End of playback is detected by polling the transport state.
+It finds your TV, sends the video the easiest way the TV allows, and tells you what to do
+when something goes wrong. It speaks **DLNA** (preferred, no setup) and **AirPlay 2**
+(for TVs without DLNA). The AirPlay side is built on
+[pyatv](https://github.com/postlund/pyatv) by Pierre Ståhl and its contributors; see
+[Credits](#credits-and-licenses).
 
-> Tested on the same Samsung UTU7000_KA, which lists no HLS among the media types it
-> plays, so the CLI sends it the file as is. That TV shows an "allow" prompt the first
-> time a new sender connects; accept it on the TV or playback stays in `TRANSITIONING`.
-> Renderers differ in which media types they accept.
+## What it does by default
 
-## Requirements
+| You give it | What happens |
+| --- | --- |
+| A file the TV can play | Sent **untouched**: the TV downloads the file itself. |
+| A file the TV cannot play | Converted **just in time** while the TV downloads it. Video and audio the TV already understands are copied, so usually only the audio (or nothing but the container) is re-encoded. No temporary files. |
+| A direct media URL (`.mp4`, `.m3u8`, ...) | Handed to the TV as is when it can fetch it (plain `http://`), otherwise relayed through this computer without re-encoding. |
+| Any other URL (a YouTube page, ...) | Asked of [yt-dlp](https://github.com/yt-dlp/yt-dlp), then relayed and converted only if needed. If a site will not let ffmpeg read the address directly (HTTP 403), yt-dlp downloads the video first, with a progress display. |
+| A web or remote video, over AirPlay | Streamed **live**: ffmpeg writes HLS segments to a temporary folder as it downloads, and playback starts after a few seconds. `--download-first` fetches everything before playing instead. |
 
-- Python 3.9+
-- `ffmpeg` and `ffprobe` on your `PATH` (not needed for HLS URLs or `.m3u8` files)
-- An AirPlay 2 receiver you have already **paired** with pyatv
+It asks the TV what it can play, so "can the TV play this?" is decided from the TV's own
+list of media types plus the video and audio codecs, not guessed from the file name.
 
 ## Install
 
 ```sh
-uv pip install .          # or: pip install .
+uv tool install .        # or: pip install .
 ```
 
-Until pyatv's SRP code supports `srptools` 2.x, this package pins `srptools<2`.
+You also need **ffmpeg** (with `ffprobe`) on your `PATH`: `brew install ffmpeg`. yt-dlp is
+installed with the package and used as a library, so nothing else is needed.
 
-## Pair first
+## Choosing the TV
+
+By default the TV is found automatically.
+
+- With **one** TV on the network it is used and remembered.
+- With **several**, you are asked once, and the answer is remembered in
+  `~/.config/pyatv-cast/config.json` (it holds only the TV's name and address, never
+  credentials).
+- From then on the remembered TV is used without searching the network.
 
 ```sh
-atvremote --id <device-id> --protocol airplay pair
+pyatv-cast --list                      # show the TVs found
+pyatv-cast movie.mkv --choose          # pick a different TV (and remember it)
+pyatv-cast movie.mkv --tv Bedroom      # this TV, just this once (name, IP or id)
+pyatv-cast --forget                    # forget the remembered TV
 ```
 
-Enter the PIN shown on the TV. pyatv stores the credentials in its own storage
-(`~/.pyatv.conf`); this package reads them from there and never prints them.
+`--protocol dlna` or `--protocol airplay` forces one; the default `auto` uses DLNA when the
+TV has it, because it needs no pairing.
 
-## Usage
-
-```sh
-pyatv-hls play movie.mkv --id AA:BB:CC:DD:EE:FF
-pyatv-hls play movie.mp4 --host 192.168.1.50 --start 600
-pyatv-hls play https://example.com/stream/index.m3u8 --id AA:BB:CC:DD:EE:FF -v
-pyatv-hls play movie.mkv --id AA:BB:CC:DD:EE:FF --no-jit --workdir /tmp/hls
-```
+## Options
 
 | Option | Meaning |
 | --- | --- |
-| `--protocol` | `airplay` (default) or `dlna` |
-| `--id` / `--host` | Receiver identifier (AirPlay) or part of its name (DLNA), or its IP address. One of `--id`, `--host`, `--location` is required |
-| `--location URL` | DLNA only: the renderer's device description URL, skipping discovery |
-| `--direct` / `--no-direct` | DLNA only: send the file unchanged, or force HLS (default: ask the renderer) |
+| `--tv TV` | A TV's name (or part of it), IP address or AirPlay id. Also `--host`, `--id`, and a DLNA description URL |
+| `--choose`, `--forget`, `--list` | Pick a TV again, forget the remembered one, or list what is on the network |
+| `--protocol {auto,dlna,airplay}` | How to reach the TV (default `auto`) |
 | `--start SECONDS` | Start position |
-| `--subtitles FILE` / `--no-subtitles` | Use this subtitle file, or send none (default: find one) |
-| `--jit` / `--no-jit` | Convert as the receiver asks (default) or convert everything first |
-| `--workdir DIR` | Parent directory for `--no-jit` output (default: a temporary directory, removed afterwards) |
-| `--credentials` | Override the stored AirPlay credentials |
-| `-v` | Log every request, response and event |
+| `--mode {auto,direct,convert}` | `auto` sends untouched when possible, `direct` never converts, `convert` always converts |
+| `--subtitles FILE` / `--no-subtitles` | Use this subtitle file, or send none |
+| `--download-first` | AirPlay with a web or remote video: download all of it (with progress) before playing, for a seek bar and subtitles, instead of streaming it live |
+| `--ytdlp-format FORMAT` | yt-dlp format selector (default: up to 1080p, H.264 + AAC, so it can be copied) |
+| `--cookies-from-browser BROWSER` | Use a browser's login for sites that need it, e.g. `chrome` |
+| `--no-jit`, `--workdir DIR` | AirPlay/HLS only: convert everything to disk first |
+| `-v` | Show everything sent and received |
 
-Include `-v` output in a bug report. Ctrl-C stops playback cleanly.
+## Subtitles
 
-The machine running this must be reachable from the TV: the TV fetches the playlist and
-segments over HTTP from a port opened on this machine's LAN address for the duration of
-playback.
+A subtitle is chosen automatically, preferring English: a file you name with
+`--subtitles`, then a file next to the video (`Movie.srt`, `Movie.en.srt`, ...), then a
+text track inside it. Conversion happens in memory.
 
-### As a library
+- **DLNA**: sent as an SRT file the TV picks up (Samsung's `CaptionInfo.sec`).
+- **AirPlay**: offered as a WebVTT track. Most TVs only load it once **you select it in
+  the TV's own subtitle menu**.
 
-```python
-from pathlib import Path
-from pyatv_hls import HlsPlayer, JitHlsServer, plan
+Subtitles for web videos are fetched by yt-dlp when the video is downloaded first
+(`--download-first`, or automatically when ffmpeg cannot read the address). They are
+fetched **separately** from the video and retried with a pause between tries, because sites
+such as YouTube often answer subtitle requests with "429 Too Many Requests". If they never
+come through, the video still plays, with a note saying so. Streaming live does not include
+subtitles; use `--subtitles FILE` or `--download-first`.
 
-player = HlsPlayer(address, port, credentials)   # pyatv HapCredentials
-await player.connect()
+## When something goes wrong
 
-media = await plan(Path("movie.mkv"))
-server = JitHlsServer(media, player.control.local_ip)
-url = await server.start()
+Every failure says what happened and what to try. For example:
 
-await player.play(url, title="Movie", start=0.0)
-await player.wait_until_ended()   # or pause() / resume() / stop()
-
-await player.stop()
-await server.stop()
-await player.close()
+```
+error: no TV was found on the network.
+  hint: Is the TV on and awake? Many TVs stop answering discovery in standby.
+        Is this computer on the same Wi-Fi or network as the TV?
+        If you know the TV's address, give it: `--tv 192.168.1.50`.
 ```
 
-For the non-just-in-time mode, replace the server with
-`StaticHlsServer(await convert_to_directory(media, Path("/tmp/hls")), player.control.local_ip)`.
+The common ones:
 
-Pass `on_event=callback` to `HlsPlayer` to receive the receiver's decoded events.
+- **The TV never starts playing.** The CLI watches for this and says whether the TV never
+  asked this computer for the video (usually a firewall: allow incoming connections for
+  Python in System Settings > Network > Firewall) or fetched it but could not play it
+  (try `--mode convert`).
+- **An "allow" prompt on the TV.** Some TVs ask the first time a new device sends to them.
+  Accept it with the remote.
+- **No TV found while a VPN is on.** A VPN or tunnel can hide the TV; the message lists
+  your network interfaces when there is more than one.
+- **A web page will not play.** Sites change often: update yt-dlp, or add
+  `--cookies-from-browser chrome` for sites that need a login.
+- **"ffmpeg cannot read this video straight from the site (403)".** Normal for YouTube and
+  similar sites. The video is downloaded with yt-dlp instead, which needs free disk space
+  (shown before it starts); use `--workdir` to put the temporary files on a bigger disk.
+- **AirPlay says "not paired".** Pair once with
+  `atvremote --id <id> --protocol airplay pair` and enter the PIN shown on the TV.
 
-For DLNA, `DlnaPlayer` has the same methods (`connect`, `play`, `pause`, `resume`, `stop`,
-`wait_until_ended`, `close`, `local_ip`):
+## How it works
+
+### DLNA
+
+The TV is found over SSDP and controlled with SOAP `AVTransport` calls
+(`SetAVTransportURI`, `Play`, `Pause`, `Seek`, `Stop`). It then downloads the media over HTTP
+from a small server this program runs for the length of playback. The renderer's
+`ConnectionManager` says which media types it plays, and that decides how the video is sent:
+
+1. **As is**: the file with HTTP Range support.
+2. **HLS**: a playlist made from the file's keyframes, with each segment produced by
+   ffmpeg only when requested (when the TV lists HLS).
+3. **Live MPEG-TS**: one ffmpeg process converting while the TV downloads (for TVs that
+   play files but not HLS), copying whichever streams are already supported.
+
+Subtitles go out as an SRT file announced in the DIDL metadata and in the `CaptionInfo.sec`
+response header. Samsung TVs also need the `contentFeatures.dlna.org` response header and a
+`Stop` before a new item; both are handled.
+
+### AirPlay 2
+
+Everything runs over one HAP-encrypted RTSP connection, using pyatv's pairing and crypto.
+The flow was captured from a commercial sender talking to a fake receiver:
+
+1. `pair-verify` with your stored credentials.
+2. `SETUP` (session), connect the encrypted **event channel**, `RECORD`, `GET /info`.
+3. `SETUP` with a stream of `type` 130; the receiver returns a `streamID`.
+4. `POST /command` (header `X-Apple-StreamID`) with `{"params": {"data": <binary plist>}}`,
+   whose inner plist is `insertPlayQueueItem` carrying an `http://` HLS playlist URL, then
+   `setRate`. `POST /feedback` every 2 s keeps the session alive.
+5. `removePlayQueueItem` and `TEARDOWN` end it.
+
+There is no `/play`, `/reverse` or FairPlay step on these receivers. HLS comes from the
+same just-in-time server as above: H.264 and AAC are copied, anything else is converted,
+and segments are cut just before the next keyframe's decode time so neighbours neither
+overlap nor leave gaps.
+
+That server needs the whole file's keyframe list up front, which for a remote video would
+mean downloading it all first. So a **remote** video is instead handled by ffmpeg writing
+HLS segments into a temporary folder as it fetches them, with a playlist that grows until
+the video is complete (an HLS `EVENT` playlist). Playback starts once the first two
+segments exist, and ffmpeg stays well ahead of playback for a copied video. The temporary
+folder is removed when playback ends or you press Ctrl-C.
+
+## Library use
 
 ```python
-from pyatv_hls import DlnaPlayer, find_renderer
+from pyatv_cast import DlnaPlayer, JitHlsServer, find_renderer, plan
+from pathlib import Path
 
 player = DlnaPlayer(await find_renderer(host="192.168.1.50"))
 await player.connect()
-# serve media with JitHlsServer(media, player.local_ip) exactly as above
-await player.play(url, title="Movie")
+server = JitHlsServer(await plan(Path("movie.mkv")), player.local_ip)   # HLS
+player.mime = "application/vnd.apple.mpegurl"
+await player.play(await server.start(), title="Movie")
+await player.wait_until_ended()
+await player.stop(); await server.stop(); await player.close()
 ```
+
+`AirPlayPlayer` (AirPlay) has the same methods; see `pyatv_cast/cli.py` for a complete example
+of choosing a delivery method.
 
 ## Development
 
 ```sh
-uv run --group dev pytest
+uv run --group dev pytest        # fails below 95% coverage
 ```
 
-The session tests run an in-process mock receiver on loopback (no encryption, no
-hardware). The HLS tests generate a tiny video with `ffmpeg` and are skipped without it.
+Network pieces are tested against in-process mock renderers and receivers. The HLS and
+streaming tests generate a tiny video with ffmpeg and are skipped without it.
 
 ## Limitations
 
-- AirPlay is tested on one receiver model, a Samsung UTU7000_KA. Others may differ.
-- DLNA is tested on the same Samsung model (direct file and subtitles) and otherwise
-  against a mock renderer.
-- No seeking while playing yet (use `--start`), choosing between several subtitle or audio
-  tracks, burned-in subtitles, DRM or playlists.
-- Transcoding uses software `libx264`, so a high-bitrate source that needs it may not
-  convert faster than real time.
+- Tested on one TV, a Samsung UTU7000_KA, over both DLNA and AirPlay. Others may differ.
+- While a web video streams live over AirPlay, the TV's seek bar covers only what has been
+  fetched so far, and subtitles are not included (`--download-first` fixes both).
+- No seeking while playing yet (use `--start`), choice between several subtitle or audio
+  tracks, burned-in subtitles (they need an ffmpeg built with libass), or DRM.
+- A converted video is streamed live, so the TV's own seek bar does not work on it.
+- Video that needs re-encoding uses VideoToolbox on a Mac, else software `libx264`, which
+  may not keep up in real time for high-bitrate sources.
 
-## Acknowledgements
+## Credits and licenses
 
-The protocol was worked out by capturing a commercial AirPlay sender talking to a fake
-receiver built on pyatv's server-side pairing code, and by reading the
-[pyatv](https://github.com/postlund/pyatv) codebase.
+### pyatv
+
+This project would not exist without **[pyatv](https://github.com/postlund/pyatv)**
+([pyatv.dev](https://pyatv.dev)), created by **Pierre Ståhl** and maintained by its
+contributors, and released under the MIT License (Copyright (c) 2020 Pierre Ståhl). It is
+the reason AirPlay works here at all. Thank you.
+
+pyatv is used as a normal dependency: it is installed from PyPI, imported as is, and none of
+its source files are copied into this repository or modified. Specifically, the AirPlay
+sender relies on pyatv for:
+
+- **Device discovery and pairing.** Scanning for AirPlay receivers, reading the credentials
+  stored by pyatv (`atvremote ... pair`), and parsing them (`pyatv.scan`,
+  `FileStorage`, `HapCredentials`).
+- **HomeKit pairing and encryption.** The `pair-verify` handshake and the HAP-encrypted
+  channel set-up, including the key derivation for the event channel
+  (`pyatv.protocols.airplay.auth`, `pyatv.auth.hap_channel`, and the event-channel salts in
+  `pyatv.protocols.airplay.ap2_session`).
+- **RTSP/HTTP transport.** The connection and request/response handling used to talk to the
+  receiver (`pyatv.support.http`, `pyatv.support.rtsp`).
+- **The event channel.** `pyatv_cast.airplay` subclasses pyatv's `EventChannel` to read the
+  receiver's playback events, and its `AirPlayError` extends pyatv's `PlaybackError`.
+
+pyatv's server-side pairing code was also used to build a throw-away fake AirPlay receiver
+for capturing how a commercial sender behaves. That is how the AirPlay video flow documented
+above was worked out; the capture tool is not part of this repository. pyatv's open
+documentation and source were the reference for the pairing and transport details.
+
+If any pyatv source is ever copied into this project, it will keep its original copyright
+and license notice and be marked as such. This project is independent: it is not affiliated
+with, or endorsed by, the pyatv project.
+
+### Other software
+
+| Project | Used for | License |
+| --- | --- | --- |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Finding the real video address behind web pages (used as a library) | Unlicense |
+| [FFmpeg](https://ffmpeg.org) | Inspecting and converting video (run as a separate program) | LGPL/GPL |
+| [aiohttp](https://github.com/aio-libs/aiohttp) | The small HTTP servers the TV downloads from | Apache-2.0 |
+| [ifaddr](https://github.com/ifaddr/ifaddr) | Listing network interfaces so discovery works with VPNs | MIT |
+| [srptools](https://github.com/idlesign/srptools) | SRP, required by pyatv's pairing | BSD |
+
+The DLNA/UPnP support follows the public UPnP AV and DLNA specifications; Samsung-specific
+behaviour (`CaptionInfo.sec`) was learned from the TV's own requests.
+
+This project is licensed under the MIT License; see [LICENSE](LICENSE).
