@@ -1,6 +1,7 @@
 """Downloading a whole video first: direct URLs, yt-dlp, separate subtitle retries."""
 
 import asyncio
+import json
 import subprocess
 import sys
 import textwrap
@@ -371,7 +372,7 @@ async def test_real_ytdlp_downloads_a_direct_link_with_progress(tmp_path):
         local = await sources.download(source, tmp_path, lambda *a: progress.append(a), want_subtitles=False)
     finally:
         await runner.cleanup()
-    assert local.path.read_bytes() == payload and local.path.read_bytes() == payload
+    assert local.path.read_bytes() == payload
     assert progress and progress[-1][0] <= len(payload) + 1
 
 
@@ -410,4 +411,33 @@ def test_keeping_a_download_falls_back_when_the_cache_is_unwritable(tmp_path):
     video.write_bytes(b"x")
     blocker = tmp_path / "blocker"
     blocker.write_text("a file, not a folder")
-    assert sources._keep(video, blocker / "sub") == video
+    assert sources._keep(video, blocker / "sub", True) == video
+
+
+def test_a_cache_marker_may_only_name_a_file_in_its_own_folder(tmp_path):
+    (tmp_path / "video.mkv").write_bytes(b"x")
+    for name in ("../video.mkv", str(tmp_path / "video.mkv"), 7):
+        (tmp_path / sources.DONE_MARKER).write_text(json.dumps({"video": name}))
+        assert sources._cached_video(tmp_path) is None
+    (tmp_path / sources.DONE_MARKER).write_text(json.dumps({"video": "video.mkv"}))
+    assert sources._cached_video(tmp_path) == tmp_path / "video.mkv"
+
+
+async def test_a_cache_hit_needs_no_free_space(monkeypatch, tmp_path):
+    _fake_video(monkeypatch)
+    _fake_subs(monkeypatch, [True])
+    await sources.download(ytdlp_source(), tmp_path)
+
+    def full(*args):
+        raise UserError("not enough free space")
+
+    monkeypatch.setattr(sources, "check_space", full)
+    assert (await sources.download(ytdlp_source(), tmp_path)).is_local
+
+
+async def test_unfinished_subtitles_are_not_cached(monkeypatch, tmp_path):
+    _fake_video(monkeypatch)
+    _fake_subs(monkeypatch, [RATE_LIMITED])
+    monkeypatch.setattr(sources, "SUBTITLE_GRACE", 0.05)
+    local = await sources.download(ytdlp_source(), tmp_path)
+    assert not list(local.path.parent.glob("*.srt"))

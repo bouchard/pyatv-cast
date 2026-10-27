@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
@@ -393,29 +394,38 @@ async def fetch_subtitles(
 def cache_dir(source: "MediaSource") -> Path:
     """Where yt-dlp downloads of this video (in this format) are kept between runs."""
     key = hashlib.sha1(f"{source.page_url}\n{source.ytdlp_format}".encode()).hexdigest()[:16]
-    return Path(tempfile.gettempdir()) / "pyatv-cast-cache" / key
+    owner = os.getuid() if hasattr(os, "getuid") else "user"  # one folder per user: /tmp is shared
+    return Path(tempfile.gettempdir()) / f"pyatv-cast-cache-{owner}" / key
 
 
 def _cached_video(directory: Path) -> Optional[Path]:
     """The finished download in a cache folder, if there is one."""
     try:
-        video = directory / json.loads((directory / DONE_MARKER).read_text())["video"]
+        name = json.loads((directory / DONE_MARKER).read_text())["video"]
     except (OSError, ValueError, KeyError, TypeError):
         return None
+    if not isinstance(name, str) or Path(name).name != name:  # a bare file name only
+        return None
+    video = directory / name
     return video if video.is_file() else None
 
 
-def _keep(path: Path, directory: Path) -> Path:
-    """Move a finished download, and its subtitles, into the cache. Falls back to where it is."""
+def _keep(path: Path, directory: Path, with_subtitles: bool) -> Path:
+    """Move a finished download into the cache. Falls back to where it is.
+
+    Subtitles come along only when their fetch has ended: a fetch still running may be
+    half way through writing a file.
+    """
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        for old in directory.iterdir():
-            old.unlink()
-        for part in sorted(path.parent.glob("video.*")):
-            if part != path and part.suffix.lower() in (".srt", ".vtt"):
+        directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.mkdir(mode=0o700, exist_ok=True)
+        if with_subtitles:
+            for part in sorted(path.parent.glob("video.*.srt")):
                 shutil.move(str(part), directory / part.name)
         kept = Path(shutil.move(str(path), directory / path.name))
-        (directory / DONE_MARKER).write_text(json.dumps({"video": kept.name}))
+        marker = directory / (DONE_MARKER + ".part")  # written last, and renamed into place
+        marker.write_text(json.dumps({"video": kept.name}))
+        marker.replace(directory / DONE_MARKER)
         return kept
     except OSError as ex:
         _LOGGER.warning("could not keep the download for next time: %s", ex)
@@ -436,8 +446,8 @@ async def download(
     retries, so a site refusing them can never fail or hold up the video.
     """
     directory.mkdir(parents=True, exist_ok=True)
-    check_space(directory, source.size_estimate)
     if not source.via_ytdlp:
+        check_space(directory, source.size_estimate)
         path = await _download_http(source, directory, on_progress)
         return MediaSource(source.title, [Input(str(path))], path, source.duration)
 
@@ -449,6 +459,8 @@ async def download(
         if on_note:
             on_note(f"using the copy downloaded earlier ({path})")
         directory = kept  # any missing subtitles are fetched next to it
+    else:
+        check_space(directory, source.size_estimate)  # nothing to fetch on a cache hit
     subs = None
     if want_subtitles and not (path and any(kept.glob("video.*.srt"))):
         subs = asyncio.ensure_future(fetch_subtitles(source, directory, verbose, on_note))
@@ -468,5 +480,5 @@ async def download(
             if on_note:
                 on_note("still waiting on subtitles: playing without them")
     if directory != kept:
-        path = _keep(path, kept)
+        path = _keep(path, kept, with_subtitles=not subs or subs.done() and not subs.cancelled())
     return MediaSource(source.title, [Input(str(path))], path, source.duration)
