@@ -205,8 +205,9 @@ async def test_ytdlp_download_returns_a_local_source_with_subtitles(monkeypatch,
     _fake_subs(monkeypatch, [True])
     notes, progress = [], []
     local = await sources.download(ytdlp_source(), tmp_path, lambda *a: progress.append(a), on_note=notes.append)
-    assert local.path == tmp_path / "video.mkv" and local.title == "Clip" and local.duration == 30.0
-    assert (tmp_path / "video.en.srt").exists() and notes == [] and progress == [(10, 100, 5.0)]
+    kept = sources.cache_dir(ytdlp_source())
+    assert local.path == kept / "video.mkv" and local.title == "Clip" and local.duration == 30.0
+    assert (kept / "video.en.srt").exists() and notes == [] and progress == [(10, 100, 5.0)]
 
 
 async def test_subtitles_are_retried_separately_until_they_work(monkeypatch, tmp_path, fast_retries):
@@ -214,7 +215,7 @@ async def test_subtitles_are_retried_separately_until_they_work(monkeypatch, tmp
     calls = _fake_subs(monkeypatch, [RATE_LIMITED, RATE_LIMITED, True])
     notes = []
     await sources.download(ytdlp_source(), tmp_path, on_note=notes.append)
-    assert len(calls) == 3 and (tmp_path / "video.en.srt").exists()
+    assert len(calls) == 3 and (sources.cache_dir(ytdlp_source()) / "video.en.srt").exists()
     assert len(notes) == 2 and all("HTTP Error 429" in n and "retrying in 0s" in n for n in notes)
 
 
@@ -370,5 +371,43 @@ async def test_real_ytdlp_downloads_a_direct_link_with_progress(tmp_path):
         local = await sources.download(source, tmp_path, lambda *a: progress.append(a), want_subtitles=False)
     finally:
         await runner.cleanup()
-    assert local.path.read_bytes() == payload and local.path.parent == tmp_path
+    assert local.path.read_bytes() == payload and local.path.read_bytes() == payload
     assert progress and progress[-1][0] <= len(payload) + 1
+
+
+async def test_a_finished_download_is_kept_and_reused(monkeypatch, tmp_path):
+    _fake_video(monkeypatch)
+    calls = _fake_subs(monkeypatch, [True])
+    first = await sources.download(ytdlp_source(), tmp_path / "one")
+    assert first.path.parent == sources.cache_dir(ytdlp_source()) and first.path.is_file()
+    assert (first.path.parent / "video.en.srt").exists() and not (tmp_path / "one" / "video.mkv").exists()
+
+    monkeypatch.setattr(sources, "_run_ytdlp_download", None)  # a second download would crash
+    notes = []
+    again = await sources.download(ytdlp_source(), tmp_path / "two", on_note=notes.append)
+    assert again.path == first.path and len(calls) == 1
+    assert notes[0].startswith("using the copy downloaded earlier")
+
+
+async def test_a_cached_video_fetches_subtitles_it_is_missing(monkeypatch, tmp_path):
+    _fake_video(monkeypatch)
+    _fake_subs(monkeypatch, [False])
+    first = await sources.download(ytdlp_source(), tmp_path)
+    calls = _fake_subs(monkeypatch, [True])
+    again = await sources.download(ytdlp_source(), tmp_path)
+    assert len(calls) == 1 and (again.path.parent / "video.en.srt").exists()
+
+
+def test_a_damaged_cache_entry_is_ignored(tmp_path):
+    (tmp_path / sources.DONE_MARKER).write_text("not json")
+    assert sources._cached_video(tmp_path) is None
+    (tmp_path / sources.DONE_MARKER).write_text('{"video": "gone.mkv"}')
+    assert sources._cached_video(tmp_path) is None
+
+
+def test_keeping_a_download_falls_back_when_the_cache_is_unwritable(tmp_path):
+    video = tmp_path / "video.mkv"
+    video.write_bytes(b"x")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file, not a folder")
+    assert sources._keep(video, blocker / "sub") == video

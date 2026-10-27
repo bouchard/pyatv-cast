@@ -5,9 +5,12 @@ is handed to yt-dlp, which finds the real media address.
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import shutil
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -338,6 +341,7 @@ def _in_daemon_thread(func: Callable[..., Any], *args: Any) -> "asyncio.Future[A
 
 
 SUBTITLE_RETRY_DELAYS = (5.0, 20.0, 60.0)  # seconds to wait before each retry
+DONE_MARKER = "done.json"
 SUBTITLE_GRACE = 20.0  # how long to keep waiting for subtitles once the video is ready
 
 
@@ -386,6 +390,38 @@ async def fetch_subtitles(
     return False
 
 
+def cache_dir(source: "MediaSource") -> Path:
+    """Where yt-dlp downloads of this video (in this format) are kept between runs."""
+    key = hashlib.sha1(f"{source.page_url}\n{source.ytdlp_format}".encode()).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / "pyatv-cast-cache" / key
+
+
+def _cached_video(directory: Path) -> Optional[Path]:
+    """The finished download in a cache folder, if there is one."""
+    try:
+        video = directory / json.loads((directory / DONE_MARKER).read_text())["video"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return video if video.is_file() else None
+
+
+def _keep(path: Path, directory: Path) -> Path:
+    """Move a finished download, and its subtitles, into the cache. Falls back to where it is."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        for old in directory.iterdir():
+            old.unlink()
+        for part in sorted(path.parent.glob("video.*")):
+            if part != path and part.suffix.lower() in (".srt", ".vtt"):
+                shutil.move(str(part), directory / part.name)
+        kept = Path(shutil.move(str(path), directory / path.name))
+        (directory / DONE_MARKER).write_text(json.dumps({"video": kept.name}))
+        return kept
+    except OSError as ex:
+        _LOGGER.warning("could not keep the download for next time: %s", ex)
+        return path
+
+
 async def download(
     source: "MediaSource",
     directory: Path,
@@ -407,11 +443,17 @@ async def download(
 
     import yt_dlp.utils
 
+    kept = cache_dir(source)
+    path = _cached_video(kept)
+    if path:
+        if on_note:
+            on_note(f"using the copy downloaded earlier ({path})")
+        directory = kept  # any missing subtitles are fetched next to it
     subs = None
-    if want_subtitles:
+    if want_subtitles and not (path and any(kept.glob("video.*.srt"))):
         subs = asyncio.ensure_future(fetch_subtitles(source, directory, verbose, on_note))
     try:
-        path = await _run_ytdlp_download(source, directory, on_progress, verbose)
+        path = path or await _run_ytdlp_download(source, directory, on_progress, verbose)
     except BaseException as ex:  # including Ctrl-C: do not leave the subtitle task running
         if subs:
             subs.cancel()
@@ -425,4 +467,6 @@ async def download(
             subs.cancel()
             if on_note:
                 on_note("still waiting on subtitles: playing without them")
+    if directory != kept:
+        path = _keep(path, kept)
     return MediaSource(source.title, [Input(str(path))], path, source.duration)

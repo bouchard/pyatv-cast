@@ -82,6 +82,10 @@ text track inside it. Conversion happens in memory.
 - **AirPlay**: offered as a WebVTT track. Most TVs only load it once **you select it in
   the TV's own subtitle menu**.
 
+Videos downloaded by yt-dlp are kept in `pyatv-cast-cache` inside the system temporary folder
+(which the OS clears on its own), so playing the same address again, in the same format, reuses
+the copy instead of downloading it again.
+
 Subtitles for web videos are fetched by yt-dlp when the video is downloaded first
 (`--download-first`, or automatically when ffmpeg cannot read the address). They are
 fetched **separately** from the video and retried with a pause between tries, because sites
