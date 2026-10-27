@@ -11,6 +11,7 @@ dependencies = [
     "pyatv>=0.16",
     "srptools<2",
     "aiohttp",
+    "ifaddr",
 ]
 
 [project.urls]

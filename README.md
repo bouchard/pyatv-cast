@@ -59,12 +59,38 @@ transcode finished before playback starts.
 An `http(s)://` HLS URL is sent to the receiver as is, and a local `.m3u8` is served as
 a static directory.
 
+## Subtitles
+
+A subtitle is picked automatically, in this order, preferring English at each step:
+
+1. a file you name with `--subtitles FILE` (`.srt` or `.vtt`)
+2. a sidecar file next to the video whose name starts with the video's name
+   (`Movie.srt`, `Movie.en.srt`, ...)
+3. a text track inside the video (SRT, ASS, `mov_text`, WebVTT; picture-based tracks
+   such as PGS are skipped)
+
+Use `--no-subtitles` to send none. Files in Windows-1252 are converted to UTF-8, and
+everything is converted in memory by ffmpeg, so nothing is written to disk.
+
+- **AirPlay** gets the subtitle as a WebVTT track in a master playlist. The receiver only
+  downloads it once the track is **selected on the TV** (use the TV's own subtitle or
+  caption menu during playback). The track is offered as the default, but the Samsung
+  tested does not select it by itself.
+- **DLNA** gets the subtitle as an SRT file announced the way Samsung renderers read it
+  (a `CaptionInfo.sec` response header and `sec:CaptionInfoEx` metadata), plus a
+  `text/srt` resource for other renderers. This works with `--direct` and the default
+  direct mode for renderers without HLS.
+
+Subtitles are not burned into the picture: that needs an ffmpeg built with libass, which
+many builds (Homebrew's included) lack.
+
 ## DLNA
 
 Many TVs that support AirPlay also run a DLNA MediaRenderer. `--protocol dlna` uses it
 instead. Nothing needs to be paired; the TV is found over SSDP, controlled with SOAP
 `AVTransport` calls (`SetAVTransportURI`, `Play`, `Pause`, `Seek`, `Stop`), and then
-fetches the media over HTTP from this machine, using the same just-in-time HLS server.
+fetches the media over HTTP from this machine. If the renderer lists HLS among what it
+plays, the same just-in-time HLS server is used; otherwise the file is sent unchanged.
 
 ```sh
 pyatv-hls play movie.mkv --protocol dlna --host 192.168.1.50
@@ -73,12 +99,15 @@ pyatv-hls play movie.mkv --protocol dlna --location http://192.168.1.50:9197/dmr
 pyatv-hls play movie.mkv --protocol dlna --host 192.168.1.50 --direct
 ```
 
-`--direct` serves the file unchanged, with HTTP Range support, instead of HLS. Use it if
-the renderer does not accept HLS; the file must then be in a format the TV plays itself.
+The CLI asks the renderer what it plays and picks for you. `--direct` serves the file
+unchanged, with HTTP Range support, instead of HLS, and `--no-direct` forces HLS. In
+direct mode the file must be in a format the TV plays itself.
 End of playback is detected by polling the transport state.
 
-> DLNA support is covered by tests against a mock renderer. It has **not yet been run on
-> real hardware**, and renderers differ in which media types they accept.
+> Tested on the same Samsung UTU7000_KA, which lists no HLS among the media types it
+> plays, so the CLI sends it the file as is. That TV shows an "allow" prompt the first
+> time a new sender connects; accept it on the TV or playback stays in `TRANSITIONING`.
+> Renderers differ in which media types they accept.
 
 ## Requirements
 
@@ -117,8 +146,9 @@ pyatv-hls play movie.mkv --id AA:BB:CC:DD:EE:FF --no-jit --workdir /tmp/hls
 | `--protocol` | `airplay` (default) or `dlna` |
 | `--id` / `--host` | Receiver identifier (AirPlay) or part of its name (DLNA), or its IP address. One of `--id`, `--host`, `--location` is required |
 | `--location URL` | DLNA only: the renderer's device description URL, skipping discovery |
-| `--direct` | DLNA only: serve the file unchanged instead of HLS |
+| `--direct` / `--no-direct` | DLNA only: send the file unchanged, or force HLS (default: ask the renderer) |
 | `--start SECONDS` | Start position |
+| `--subtitles FILE` / `--no-subtitles` | Use this subtitle file, or send none (default: find one) |
 | `--jit` / `--no-jit` | Convert as the receiver asks (default) or convert everything first |
 | `--workdir DIR` | Parent directory for `--no-jit` output (default: a temporary directory, removed afterwards) |
 | `--credentials` | Override the stored AirPlay credentials |
@@ -180,9 +210,10 @@ hardware). The HLS tests generate a tiny video with `ffmpeg` and are skipped wit
 ## Limitations
 
 - AirPlay is tested on one receiver model, a Samsung UTU7000_KA. Others may differ.
-- DLNA is only tested against a mock renderer.
-- No seeking while playing yet (use `--start`), subtitles, multiple audio tracks, DRM or
-  playlists.
+- DLNA is tested on the same Samsung model (direct file and subtitles) and otherwise
+  against a mock renderer.
+- No seeking while playing yet (use `--start`), choosing between several subtitle or audio
+  tracks, burned-in subtitles, DRM or playlists.
 - Transcoding uses software `libx264`, so a high-bitrate source that needs it may not
   convert faster than real time.
 

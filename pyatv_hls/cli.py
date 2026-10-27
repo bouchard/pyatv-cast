@@ -14,7 +14,7 @@ from pyatv.auth.hap_pairing import parse_credentials
 from pyatv.const import Protocol
 from pyatv.storage.file_storage import FileStorage
 
-from pyatv_hls import dlna, hls
+from pyatv_hls import dlna, hls, subtitles
 from pyatv_hls.session import HlsPlayer
 
 HLS_MIME = "application/vnd.apple.mpegurl"
@@ -46,6 +46,7 @@ class Source(NamedTuple):
     server: Optional[Any]
     duration: Optional[float]
     mime: str = HLS_MIME
+    subtitle_url: Optional[str] = None
 
 
 async def _serve(args: argparse.Namespace, local_ip: str, workdir: Optional[Path]) -> Source:
@@ -57,12 +58,20 @@ async def _serve(args: argparse.Namespace, local_ip: str, workdir: Optional[Path
     if path.suffix == ".m3u8":
         server = hls.StaticHlsServer(path, local_ip)
         return Source(await server.start(), server, None)
+    subtitle = None
+    if not args.no_subtitles:
+        explicit = Path(args.subtitles) if args.subtitles else None
+        try:
+            subtitle = await subtitles.find(path, explicit)
+        except FileNotFoundError as ex:
+            sys.exit(str(ex))
     if args.direct:
         info = await hls.probe(path)
-        direct = dlna.DirectFileServer(path, local_ip)
+        direct = dlna.DirectFileServer(path, local_ip, subtitle=subtitle)
         duration = float(info["format"]["duration"])
-        return Source(await direct.start(), direct, duration, dlna.guess_mime(path))
-    media = await hls.plan(path)
+        url = await direct.start()
+        return Source(url, direct, duration, dlna.guess_mime(path), direct.subtitle_url)
+    media = await hls.plan(path, subtitle)
     if args.jit:
         server = hls.JitHlsServer(media, local_ip)
     else:
@@ -102,11 +111,15 @@ async def play(args: argparse.Namespace) -> None:
     await player.connect()
     server = None
     try:
+        if isinstance(player, dlna.DlnaPlayer) and args.direct is None:
+            args.direct = not await player.supports_hls()
+            print("renderer plays HLS" if not args.direct else "renderer has no HLS: sending the file as is")
         source = await _serve(args, player.local_ip, Path(workdir.name) if workdir else None)
         server = source.server
         if isinstance(player, dlna.DlnaPlayer):
             player.mime = source.mime
-        await player.play(source.url, title=Path(args.source).stem, start=args.start)
+        extra = {"subtitle_url": source.subtitle_url} if isinstance(player, dlna.DlnaPlayer) else {}
+        await player.play(source.url, title=Path(args.source).stem, start=args.start, **extra)
         ticker = asyncio.ensure_future(_progress(time.monotonic(), source.duration))
         try:
             limit = (source.duration - args.start + 30) if source.duration else None
@@ -140,8 +153,9 @@ def main() -> None:
     target.add_argument("--host", help="device IP address")
     target.add_argument("--location", help="DLNA device description URL (skips discovery)")
     p.add_argument(
-        "--direct", action="store_true",
-        help="DLNA: serve the file unchanged instead of as HLS, for renderers without HLS",
+        "--direct", action=argparse.BooleanOptionalAction, default=None,
+        help="DLNA: serve the file unchanged instead of as HLS (default: ask the "
+        "renderer, and send the file as is unless it lists HLS)",
     )  # fmt: skip
     p.add_argument("--credentials", help="override stored AirPlay credentials")
     p.add_argument(
@@ -150,12 +164,20 @@ def main() -> None:
         "--no-jit converts the whole file to --workdir before playing",
     )  # fmt: skip
     p.add_argument("--workdir", help="parent directory for --no-jit output (default: temp)")
+    p.add_argument(
+        "--subtitles", metavar="FILE",
+        help="subtitle file (.srt or .vtt) to show; by default a file next to the video, "
+        "or a text track inside it, is used (English preferred)",
+    )  # fmt: skip
+    p.add_argument("--no-subtitles", action="store_true", help="do not send subtitles")
     p.add_argument("--start", type=float, default=0.0, help="start position (s)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
     if not (args.id or args.host or args.location):
         parser.error("one of --id, --host or --location is required")
-    if args.protocol == "airplay" and (args.location or args.direct):
+    if args.subtitles and args.no_subtitles:
+        parser.error("--subtitles and --no-subtitles cannot be used together")
+    if args.protocol == "airplay" and (args.location or args.direct is not None):
         parser.error("--location and --direct only apply to --protocol dlna")
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)

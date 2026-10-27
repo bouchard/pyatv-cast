@@ -11,11 +11,12 @@ import logging
 import mimetypes
 import socket
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 from xml.sax.saxutils import escape
 
 import aiohttp
+import ifaddr
 from aiohttp import web
 from pathlib import Path
 
@@ -24,6 +25,7 @@ _LOGGER = logging.getLogger(__name__)
 SSDP_GROUP = ("239.255.255.250", 1900)
 MEDIA_RENDERER = "urn:schemas-upnp-org:device:MediaRenderer:1"
 AV_TRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
+CONNECTION_MANAGER = "urn:schemas-upnp-org:service:ConnectionManager:1"
 POLL_INTERVAL = 2.0
 POLL_FAILURES = 5
 PLAY_WAIT = 15.0
@@ -40,12 +42,20 @@ class DlnaError(Exception):
 class Renderer:
     """A discovered MediaRenderer."""
 
-    def __init__(self, location: str, friendly_name: str, udn: str, control_url: str):
+    def __init__(
+        self,
+        location: str,
+        friendly_name: str,
+        udn: str,
+        control_url: str,
+        connection_url: Optional[str] = None,
+    ):
         """Initialize a new Renderer."""
         self.location = location
         self.friendly_name = friendly_name
         self.udn = udn
         self.control_url = control_url
+        self.connection_url = connection_url
 
     @property
     def host(self) -> str:
@@ -60,10 +70,14 @@ def parse_description(location: str, xml_text: str) -> Renderer:
     if device is None:
         raise DlnaError(f"{location}: not a UPnP device description")
     base = root.findtext("d:URLBase", default=location, namespaces=_DEVICE_NS)
-    control = None
+    control = connection = None
     for service in root.iter("{%s}service" % _DEVICE_NS["d"]):
-        if service.findtext("d:serviceType", namespaces=_DEVICE_NS) == AV_TRANSPORT:
-            control = urljoin(base, service.findtext("d:controlURL", namespaces=_DEVICE_NS))
+        kind = service.findtext("d:serviceType", namespaces=_DEVICE_NS)
+        url = urljoin(base, service.findtext("d:controlURL", namespaces=_DEVICE_NS) or "")
+        if kind == AV_TRANSPORT:
+            control = url
+        elif kind == CONNECTION_MANAGER:
+            connection = url
     if control is None:
         raise DlnaError(f"{location}: device has no AVTransport service")
     return Renderer(
@@ -71,6 +85,7 @@ def parse_description(location: str, xml_text: str) -> Renderer:
         device.findtext("d:friendlyName", default="", namespaces=_DEVICE_NS),
         device.findtext("d:UDN", default="", namespaces=_DEVICE_NS),
         control,
+        connection,
     )
 
 
@@ -86,27 +101,55 @@ class _Search(asyncio.DatagramProtocol):
                     self.locations.append(location)
 
 
+def local_addresses() -> List[str]:
+    """IPv4 addresses of this machine's interfaces, excluding loopback and link-local."""
+    found = []
+    for adapter in ifaddr.get_adapters():
+        for ip in adapter.ips:
+            if isinstance(ip.ip, str) and not ip.ip.startswith(("127.", "169.254.")):
+                found.append(ip.ip)
+    return found
+
+
 async def ssdp_search(
     timeout: float = 3.0, target: Tuple[str, int] = SSDP_GROUP
 ) -> List[str]:
-    """Return the description URLs of every MediaRenderer that answers an M-SEARCH."""
+    """Return the description URLs of every MediaRenderer that answers an M-SEARCH.
+
+    The search is sent from every local interface. A single multicast socket would
+    leave through the default route, which on a machine with a VPN or tunnel is often
+    not the LAN.
+    """
     loop = asyncio.get_running_loop()
-    transport, protocol = await loop.create_datagram_endpoint(
-        _Search, family=socket.AF_INET, local_addr=("0.0.0.0", 0)
-    )
+    message = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: {SSDP_GROUP[0]}:{SSDP_GROUP[1]}\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        f"MX: {max(1, int(timeout))}\r\n"
+        f"ST: {MEDIA_RENDERER}\r\n\r\n"
+    ).encode()
+    endpoints = []
+    for address in local_addresses():
+        try:
+            transport, protocol = await loop.create_datagram_endpoint(
+                _Search, family=socket.AF_INET, local_addr=(address, 0)
+            )
+        except OSError as ex:
+            _LOGGER.debug("cannot search from %s: %s", address, ex)
+            continue
+        sock = transport.get_extra_info("socket")
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(address))
+        transport.sendto(message, target)
+        endpoints.append((transport, protocol))
     try:
-        message = (
-            "M-SEARCH * HTTP/1.1\r\n"
-            f"HOST: {SSDP_GROUP[0]}:{SSDP_GROUP[1]}\r\n"
-            'MAN: "ssdp:discover"\r\n'
-            f"MX: {max(1, int(timeout))}\r\n"
-            f"ST: {MEDIA_RENDERER}\r\n\r\n"
-        )
-        transport.sendto(message.encode(), target)
         await asyncio.sleep(timeout)
-        return protocol.locations
+        locations: List[str] = []
+        for _, protocol in endpoints:
+            locations += [loc for loc in protocol.locations if loc not in locations]
+        return locations
     finally:
-        transport.close()
+        for transport, _ in endpoints:
+            transport.close()
 
 
 async def _fetch(http: aiohttp.ClientSession, location: str) -> Optional[Renderer]:
@@ -140,17 +183,28 @@ async def find_renderer(
     raise DlnaError(f"no matching DLNA renderer found; saw: {seen}")
 
 
-def didl(url: str, title: str, mime: str) -> str:
-    """Build the DIDL-Lite metadata describing the item."""
+def didl(url: str, title: str, mime: str, subtitle_url: Optional[str] = None) -> str:
+    """Build the DIDL-Lite metadata describing the item.
+
+    A subtitle is announced the way Samsung renderers read it (``sec:CaptionInfoEx``)
+    and as a second ``res`` of type ``text/srt`` for other renderers.
+    """
+    caption = ""
+    if subtitle_url:
+        caption = (
+            f'<res protocolInfo="http-get:*:text/srt:*">{escape(subtitle_url)}</res>'
+            f'<sec:CaptionInfoEx sec:type="srt">{escape(subtitle_url)}</sec:CaptionInfoEx>'
+        )
     return (
         '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
         'xmlns:dc="http://purl.org/dc/elements/1.1/" '
-        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+        'xmlns:sec="http://www.sec.co.kr/">'
         '<item id="0" parentID="-1" restricted="1">'
         f"<dc:title>{escape(title)}</dc:title>"
         "<upnp:class>object.item.videoItem</upnp:class>"
         f'<res protocolInfo="http-get:*:{mime}:{_FLAGS}">{escape(url)}</res>'
-        "</item></DIDL-Lite>"
+        f"{caption}</item></DIDL-Lite>"
     )
 
 
@@ -191,13 +245,26 @@ class DlnaPlayer:
             await self._http.close()
             self._http = None
 
-    async def play(self, url: str, title: str = "", start: float = 0.0) -> None:
-        """Load ``url`` on the renderer and start playing, optionally from ``start``."""
+    async def play(
+        self,
+        url: str,
+        title: str = "",
+        start: float = 0.0,
+        subtitle_url: Optional[str] = None,
+    ) -> None:
+        """Load ``url`` on the renderer and start playing, optionally from ``start``.
+
+        ``subtitle_url`` points at an SRT file the renderer should show.
+        """
         self.ended.clear()
+        try:  # a renderer left mid-load by an earlier session answers "transport is locked"
+            await self._action("Stop")
+        except DlnaError:
+            _LOGGER.debug("nothing to stop")
         await self._action(
             "SetAVTransportURI",
             CurrentURI=escape(url),
-            CurrentURIMetaData=escape(didl(url, title, self.mime)),
+            CurrentURIMetaData=escape(didl(url, title, self.mime, subtitle_url)),
         )
         await self._action("Play", Speed="1")
         self._poll = asyncio.ensure_future(self._poll_state())
@@ -228,28 +295,53 @@ class DlnaPlayer:
 
     # -- internals --------------------------------------------------------
 
-    async def _action(self, name: str, **arguments: str) -> Dict[str, str]:
+    async def supports_hls(self) -> bool:
+        """Ask the renderer whether it lists an HLS media type among what it can play.
+
+        When it cannot say, assume it cannot: plain files are the safer choice.
+        """
+        if not self.renderer.connection_url:
+            return False
+        try:
+            info = await self._action(
+                "GetProtocolInfo", service=CONNECTION_MANAGER,
+                url=self.renderer.connection_url, instance=False,
+            )  # fmt: skip
+        except (DlnaError, aiohttp.ClientError, asyncio.TimeoutError):
+            return False
+        return "mpegurl" in info.get("Sink", "").lower()
+
+    async def _action(
+        self,
+        name: str,
+        service: str = AV_TRANSPORT,
+        url: Optional[str] = None,
+        instance: bool = True,
+        **arguments: str,
+    ) -> Dict[str, str]:
         assert self._http is not None
-        args = "".join(f"<{k}>{v}</{k}>" for k, v in {"InstanceID": "0", **arguments}.items())
+        if instance:
+            arguments = {"InstanceID": "0", **arguments}
+        args = "".join(f"<{k}>{v}</{k}>" for k, v in arguments.items())
         body = (
             '<?xml version="1.0" encoding="utf-8"?>'
             '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
             's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
-            f'<u:{name} xmlns:u="{AV_TRANSPORT}">{args}</u:{name}>'
+            f'<u:{name} xmlns:u="{service}">{args}</u:{name}>'
             "</s:Body></s:Envelope>"
         )
         headers = {
             "Content-Type": 'text/xml; charset="utf-8"',
-            "SOAPACTION": f'"{AV_TRANSPORT}#{name}"',
+            "SOAPACTION": f'"{service}#{name}"',
         }
         async with self._http.post(
-            self.renderer.control_url, data=body.encode(), headers=headers,
+            url or self.renderer.control_url, data=body.encode(), headers=headers,
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:  # fmt: skip
             text = await resp.text()
             if resp.status != 200:
                 raise DlnaError(f"{name} failed: HTTP {resp.status} {_upnp_error(text)}")
-        reply = ET.fromstring(text).find(".//{%s}%sResponse" % (AV_TRANSPORT, name))
+        reply = ET.fromstring(text).find(".//{%s}%sResponse" % (service, name))
         return {child.tag.split("}")[-1]: child.text or "" for child in (reply or [])}
 
     async def _state(self) -> str:
@@ -297,32 +389,64 @@ def _upnp_error(text: str) -> str:
 
 def guess_mime(path: Path) -> str:
     """Best-effort media type for a video file."""
+    if path.suffix.lower() == ".mkv":
+        return "video/x-mkv"  # what DLNA renderers list, not video/x-matroska
     return mimetypes.guess_type(path.name)[0] or "video/mp4"
 
 
 class DirectFileServer:
-    """Serve one file unchanged, with Range support, for renderers that play it as is."""
+    """Serve one file unchanged, with Range support, for renderers that play it as is.
 
-    def __init__(self, path: Path, address: str, port: int = 0) -> None:
+    An optional subtitle is served as ``/subs.srt`` and announced to the renderer in
+    the ``CaptionInfo.sec`` header (what Samsung renderers ask for).
+    """
+
+    def __init__(self, path: Path, address: str, port: int = 0, subtitle: Any = None) -> None:
         """Initialize a new DirectFileServer."""
         self._path = path
         self._address = address
         self._port = port
+        self._subtitle = subtitle
+        self._srt = b""
         self._runner: Optional[web.AppRunner] = None
+        self.subtitle_url: Optional[str] = None
 
     async def _serve(self, request: web.Request) -> web.StreamResponse:
-        return web.FileResponse(self._path, headers={"transferMode.dlna.org": "Streaming"})
+        _LOGGER.debug(
+            "%s %s from %s headers=%s", request.method, request.path, request.remote,
+            dict(request.headers),
+        )  # fmt: skip
+        # Renderers ask for these with "getcontentFeatures.dlna.org: 1" and some
+        # (Samsung) wait forever without an answer
+        headers = {
+            "transferMode.dlna.org": "Streaming",
+            "contentFeatures.dlna.org": _FLAGS,
+            "Accept-Ranges": "bytes",
+        }
+        if self.subtitle_url:
+            headers["CaptionInfo.sec"] = self.subtitle_url
+        return web.FileResponse(self._path, headers=headers)
+
+    async def _serve_subtitle(self, request: web.Request) -> web.Response:
+        _LOGGER.debug("subtitle requested by %s", request.remote)
+        return web.Response(body=self._srt, content_type="text/srt", charset="utf-8")
 
     async def start(self) -> str:
         """Start serving and return the file's URL."""
         app = web.Application()
-        app.router.add_get("/media{ext:\\.[A-Za-z0-9]+}", self._serve)
+        app.router.add_route("*", "/media{ext:\\.[A-Za-z0-9]+}", self._serve)
+        if self._subtitle is not None:
+            self._srt = await self._subtitle.srt()
+            app.router.add_get("/subs.srt", self._serve_subtitle)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self._address, self._port)
         await site.start()
         port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
-        return f"http://{self._address}:{port}/media{self._path.suffix or '.mp4'}"
+        base = f"http://{self._address}:{port}"
+        if self._subtitle is not None:
+            self.subtitle_url = f"{base}/subs.srt"
+        return f"{base}/media{self._path.suffix or '.mp4'}"
 
     async def stop(self) -> None:
         """Stop serving."""

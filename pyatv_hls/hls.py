@@ -11,13 +11,16 @@ import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from aiohttp import web
 
 _LOGGER = logging.getLogger(__name__)
 
 PLAYLIST_NAME = "index.m3u8"
+MASTER_NAME = "master.m3u8"
+SUBTITLE_PLAYLIST_NAME = "subs.m3u8"
+SUBTITLE_NAME = "subs.vtt"
 SEGMENT_TARGET_SECONDS = 6.0
 CACHE_SEGMENTS = 6
 MAX_FFMPEG = 2
@@ -44,10 +47,55 @@ class MediaPlan:
     copy_audio: bool
     has_audio: bool
     audio_index: int
+    bandwidth: int = 8_000_000
+    resolution: Optional[str] = None
+    codecs: Optional[str] = None  # only known when the streams are copied as they are
+    subtitle: Optional[Any] = None  # a pyatv_hls.subtitles.Subtitle
     # Added to every segment's timestamps. The first video packet has a negative decode
     # time, which the muxer would otherwise shift for segment 0 only.
     ts_shift: float = 0.0
     segments: List[Segment] = field(default_factory=list)
+
+    @property
+    def entry_name(self) -> str:
+        """The playlist the receiver should be given."""
+        return MASTER_NAME if self.subtitle else PLAYLIST_NAME
+
+    def master(self) -> str:
+        """Render the master playlist that adds the subtitle track."""
+        sub = self.subtitle
+        language = f'LANGUAGE="{sub.language}",' if sub.language else ""
+        attrs = [f"BANDWIDTH={self.bandwidth}"]
+        if self.resolution:
+            attrs.append(f"RESOLUTION={self.resolution}")
+        if self.codecs:
+            attrs.append(f'CODECS="{self.codecs}"')
+        attrs.append('SUBTITLES="subs"')
+        return (
+            "#EXTM3U\n#EXT-X-VERSION:3\n"
+            f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{sub.name}",{language}'
+            f'DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI="{SUBTITLE_PLAYLIST_NAME}"\n'
+            f"#EXT-X-STREAM-INF:{','.join(attrs)}\n{PLAYLIST_NAME}\n"
+        )
+
+    def subtitle_playlist(self) -> str:
+        """Render the playlist holding the whole subtitle as one WebVTT segment."""
+        return (
+            "#EXTM3U\n#EXT-X-VERSION:3\n"
+            f"#EXT-X-TARGETDURATION:{int(self.duration + 0.999)}\n"
+            "#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+            f"#EXTINF:{self.duration:.3f},\n{SUBTITLE_NAME}\n#EXT-X-ENDLIST\n"
+        )
+
+    def webvtt(self, vtt: bytes) -> bytes:
+        """Tell the player how WebVTT time zero maps onto the segments' timestamps.
+
+        Our segments start at ``ts_shift`` seconds rather than 0, and without this
+        header the cues would run that much early.
+        """
+        header, _, rest = vtt.partition(b"\n")
+        stamp = f"X-TIMESTAMP-MAP=MPEGTS:{round(self.ts_shift * 90000)},LOCAL:00:00:00.000"
+        return header + b"\n" + stamp.encode() + b"\n" + rest
 
     def playlist(self) -> str:
         """Render the VOD media playlist."""
@@ -73,6 +121,30 @@ async def _run(*args: str) -> bytes:
     if proc.returncode != 0:
         raise RuntimeError(f"{args[0]} failed: {err.decode(errors='replace')[-500:]}")
     return out
+
+
+async def _run_with_input(data: bytes, *args: str) -> bytes:
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )  # fmt: skip
+    out, err = await proc.communicate(data)
+    if proc.returncode != 0:
+        raise RuntimeError(f"{args[0]} failed: {err.decode(errors='replace')[-500:]}")
+    return out
+
+
+_H264_PROFILES = (("baseline", 0x42), ("main", 0x4D), ("high", 0x64))
+
+
+def h264_codec_string(profile: Optional[str], level: Optional[int]) -> str:
+    """Return an RFC 6381 ``avc1`` string, e.g. ``avc1.640028``.
+
+    ffprobe names profiles like "Constrained Baseline", so match on a keyword.
+    """
+    name = (profile or "high").lower()
+    profile_idc = next((idc for key, idc in _H264_PROFILES if key in name), 0x64)
+    return f"avc1.{profile_idc:02X}00{(level or 40):02X}"
 
 
 async def probe(source: Path) -> dict:
@@ -127,8 +199,11 @@ def _pick_audio(streams: List[dict]) -> Tuple[Optional[dict], int]:
     return audio[0], 0
 
 
-async def plan(source: Path) -> MediaPlan:
-    """Probe ``source`` and decide what has to be converted."""
+async def plan(source: Path, subtitle: Optional[Any] = None) -> MediaPlan:
+    """Probe ``source`` and decide what has to be converted.
+
+    ``subtitle`` is an optional :class:`pyatv_hls.subtitles.Subtitle` to offer with it.
+    """
     info = await probe(source)
     video = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
     if video is None:
@@ -142,7 +217,15 @@ async def plan(source: Path) -> MediaPlan:
         copy_audio=audio is not None and audio["codec_name"] == "aac",
         has_audio=audio is not None,
         audio_index=audio_index,
+        bandwidth=int(info["format"].get("bit_rate", 0)) or 8_000_000,
+        resolution=f"{video['width']}x{video['height']}",
+        subtitle=subtitle,
     )
+    if result.copy_video and (audio is None or result.copy_audio):
+        codecs = [h264_codec_string(video.get("profile"), video.get("level"))]
+        if audio is not None:
+            codecs.append("mp4a.40.2")
+        result.codecs = ",".join(codecs)
     keys = await keyframes(source)
     result.ts_shift = max(0.0, -keys[0][1]) if keys else 0.0
     result.segments = plan_segments(keys, duration)
@@ -183,6 +266,13 @@ def segment_command(media: MediaPlan, index: int) -> List[str]:
         "-f", "mpegts", "pipe:1",
     ]  # fmt: skip
     return cmd
+
+
+@web.middleware
+async def _log_requests(request: web.Request, handler):
+    response = await handler(request)
+    _LOGGER.debug("%s %s -> %s (%s)", request.method, request.path, response.status, request.remote)
+    return response
 
 
 class JitHlsServer:
@@ -228,6 +318,18 @@ class JitHlsServer:
             text=self._media.playlist(), content_type="application/vnd.apple.mpegurl"
         )
 
+    async def _master(self, request: web.Request) -> web.Response:
+        return web.Response(text=self._media.master(), content_type="application/vnd.apple.mpegurl")
+
+    async def _subtitle_playlist(self, request: web.Request) -> web.Response:
+        return web.Response(
+            text=self._media.subtitle_playlist(), content_type="application/vnd.apple.mpegurl"
+        )
+
+    async def _subtitle(self, request: web.Request) -> web.Response:
+        vtt = self._media.webvtt(await self._media.subtitle.webvtt())
+        return web.Response(body=vtt, content_type="text/vtt", charset="utf-8")
+
     async def _segment(self, request: web.Request) -> web.Response:
         index = int(request.match_info["index"])
         if not 0 <= index < len(self._media.segments):
@@ -242,15 +344,19 @@ class JitHlsServer:
 
     async def start(self) -> str:
         """Start serving and return the playlist URL."""
-        app = web.Application()
+        app = web.Application(middlewares=[_log_requests])
         app.router.add_get(f"/{PLAYLIST_NAME}", self._playlist)
+        if self._media.subtitle:
+            app.router.add_get(f"/{MASTER_NAME}", self._master)
+            app.router.add_get(f"/{SUBTITLE_PLAYLIST_NAME}", self._subtitle_playlist)
+            app.router.add_get(f"/{SUBTITLE_NAME}", self._subtitle)
         app.router.add_get(r"/seg{index:\d+}.ts", self._segment)
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self._address, self._port)
         await site.start()
         port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
-        return f"http://{self._address}:{port}/{PLAYLIST_NAME}"
+        return f"http://{self._address}:{port}/{self._media.entry_name}"
 
     async def stop(self) -> None:
         """Stop serving and drop cached segments."""
@@ -277,6 +383,11 @@ async def convert_to_directory(media: MediaPlan, directory: Path) -> Path:
     await asyncio.gather(*(one(i) for i in range(len(media.segments))))
     playlist = directory / PLAYLIST_NAME
     playlist.write_text(media.playlist())
+    if media.subtitle:
+        (directory / SUBTITLE_NAME).write_bytes(media.webvtt(await media.subtitle.webvtt()))
+        (directory / SUBTITLE_PLAYLIST_NAME).write_text(media.subtitle_playlist())
+        playlist = directory / MASTER_NAME
+        playlist.write_text(media.master())
     return playlist
 
 

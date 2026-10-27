@@ -22,7 +22,7 @@ def _args(**kwargs):
     defaults = dict(
         source="movie.mp4", id="AA:BB", host=None, credentials=None, jit=True,
         workdir=None, start=0.0, verbose=False, protocol="airplay", location=None,
-        direct=False,
+        direct=None, subtitles=None, no_subtitles=False,
     )  # fmt: skip
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -266,7 +266,8 @@ async def test_make_player_dlna_not_found(monkeypatch):
         await cli._make_player(_args(protocol="dlna"))
 
 
-async def test_play_sets_the_dlna_media_type(fake_play, monkeypatch):
+@pytest.mark.parametrize("hls_support,direct", [(True, False), (False, True)])
+async def test_play_sets_the_dlna_media_type(fake_play, monkeypatch, capsys, hls_support, direct):
     renderer = dlna.Renderer("http://10.0.0.9:1/dmr", "TV", "u", "http://10.0.0.9:1/c")
     player = dlna.DlnaPlayer(renderer)
     player.local_ip = "127.0.0.1"
@@ -274,6 +275,7 @@ async def test_play_sets_the_dlna_media_type(fake_play, monkeypatch):
     for name in ("connect", "stop", "close"):
         monkeypatch.setattr(player, name, lambda name=name: _done(calls.append(name)))
     monkeypatch.setattr(player, "play", lambda *a, **k: _done(calls.append(("play", a, k))))
+    monkeypatch.setattr(player, "supports_hls", lambda: _done(hls_support))
     player.ended.set()
 
     async def make_player(args):
@@ -284,8 +286,34 @@ async def test_play_sets_the_dlna_media_type(fake_play, monkeypatch):
 
     monkeypatch.setattr(cli, "_make_player", make_player)
     monkeypatch.setattr(cli, "_serve", serve)
-    await cli.play(_args(protocol="dlna", source="a.mkv"))
+    args = _args(protocol="dlna", source="a.mkv")
+    await cli.play(args)
     assert player.mime == "video/x-matroska" and calls[1][0] == "play"
+    assert args.direct is direct  # asked the renderer
+    assert ("no HLS" in capsys.readouterr().out) is direct
+
+
+async def test_explicit_direct_choice_is_not_overridden(fake_play, monkeypatch):
+    renderer = dlna.Renderer("http://10.0.0.9:1/dmr", "TV", "u", "http://10.0.0.9:1/c")
+    player = dlna.DlnaPlayer(renderer)
+    player.local_ip = "127.0.0.1"
+    player.ended.set()
+    for name in ("connect", "stop", "close"):
+        monkeypatch.setattr(player, name, lambda: _done())
+    monkeypatch.setattr(player, "play", lambda *a, **k: _done())
+
+    async def never_asked():
+        raise AssertionError("must not ask the renderer")
+
+    monkeypatch.setattr(player, "supports_hls", never_asked)
+
+    async def make_player(args):
+        return player
+
+    monkeypatch.setattr(cli, "_make_player", make_player)
+    args = _args(protocol="dlna", direct=False)
+    await cli.play(args)
+    assert args.direct is False
 
 
 async def _done(value=None):
@@ -300,7 +328,7 @@ async def test_serve_direct_serves_the_file_unchanged(tmp_path):
     _make_video(source, "libx264", "aac")
     served = await cli._serve(_args(source=str(source), direct=True), "127.0.0.1", None)
     try:
-        assert served.url.endswith("/media.mkv") and served.mime == "video/x-matroska"
+        assert served.url.endswith("/media.mkv") and served.mime == "video/x-mkv"
         assert served.duration == pytest.approx(14, abs=0.5)
     finally:
         await served.server.stop()
@@ -311,6 +339,7 @@ async def test_serve_direct_serves_the_file_unchanged(tmp_path):
     [
         (["play", "m.mkv"], "one of --id, --host or --location"),
         (["play", "m.mkv", "--id", "x", "--direct"], "only apply to --protocol dlna"),
+        (["play", "m.mkv", "--id", "x", "--no-direct"], "only apply to --protocol dlna"),
         (["play", "m.mkv", "--id", "x", "--location", "http://x"], "not allowed with"),
     ],
 )

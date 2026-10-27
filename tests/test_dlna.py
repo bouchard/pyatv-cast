@@ -2,12 +2,15 @@
 
 import asyncio
 import xml.etree.ElementTree as ET
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
 from aiohttp import web
 
 from pyatv_hls import dlna
+
+REAL_LOCAL_ADDRESSES = dlna.local_addresses
 
 DESCRIPTION = """<?xml version="1.0"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
@@ -18,6 +21,10 @@ DESCRIPTION = """<?xml version="1.0"?>
       <service>
         <serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>
         <controlURL>/rc</controlURL>
+      </service>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+        <controlURL>/cm</controlURL>
       </service>
       <service>
         <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
@@ -40,6 +47,7 @@ class MockRenderer:
         self.actions = []
         self.states = ["STOPPED"]  # consumed by GetTransportInfo, last one repeats
         self.fail = {}  # action name -> HTTP status
+        self.sink = "http-get:*:video/mp4:*,http-get:*:video/x-mkv:*"
 
     async def description(self, request):
         return web.Response(text=DESCRIPTION, content_type="text/xml")
@@ -66,8 +74,18 @@ class MockRenderer:
         reply = f'<u:{action}Response xmlns:u="{dlna.AV_TRANSPORT}">{inner}</u:{action}Response>'
         return web.Response(text=ENVELOPE.format(reply), content_type="text/xml")
 
+    async def connection(self, request):
+        if "GetProtocolInfo" in self.fail:
+            return web.Response(status=500)
+        reply = (
+            f'<u:GetProtocolInfoResponse xmlns:u="{dlna.CONNECTION_MANAGER}">'
+            f"<Source></Source><Sink>{self.sink}</Sink></u:GetProtocolInfoResponse>"
+        )
+        return web.Response(text=ENVELOPE.format(reply), content_type="text/xml")
+
     async def start(self):
         app = web.Application()
+        app.router.add_post("/cm", self.connection)
         app.router.add_get("/dmr", self.description)
         app.router.add_post("/ctl", self.control)
         self.runner = web.AppRunner(app, access_log=None)
@@ -76,6 +94,11 @@ class MockRenderer:
         await site.start()
         self.port = site._server.sockets[0].getsockname()[1]
         return f"http://127.0.0.1:{self.port}/dmr"
+
+
+@pytest.fixture(autouse=True)
+def loopback_search(monkeypatch):
+    monkeypatch.setattr(dlna, "local_addresses", lambda: ["127.0.0.1"])
 
 
 @pytest.fixture
@@ -91,6 +114,7 @@ def test_parse_description():
     renderer = dlna.parse_description("http://10.0.0.5:9197/dmr", DESCRIPTION)
     assert renderer.friendly_name == "[TV] Living Room" and renderer.udn == "uuid:1234"
     assert renderer.control_url == "http://10.0.0.5:9197/ctl"
+    assert renderer.connection_url == "http://10.0.0.5:9197/cm"
     assert renderer.host == "10.0.0.5"
 
 
@@ -202,9 +226,9 @@ async def test_play_sequence_and_controls(renderer):
     await player.close()
 
     names = [a for a, _ in renderer.actions]
-    assert names[:2] == ["SetAVTransportURI", "Play"]
+    assert names[:3] == ["Stop", "SetAVTransportURI", "Play"]  # Stop clears an old session
     assert "Seek" in names and names[-3:] == ["Pause", "Play", "Stop"]
-    uri = dict(renderer.actions[0][1])
+    uri = next(args for a, args in renderer.actions if a == "SetAVTransportURI")
     assert uri["CurrentURI"] == "http://127.0.0.1:1/index.m3u8"
     assert "Movie" in uri["CurrentURIMetaData"]
     seek = next(args for a, args in renderer.actions if a == "Seek")
@@ -279,6 +303,8 @@ async def test_direct_file_server_supports_ranges(tmp_path):
                 assert resp.status == 206
                 assert await resp.read() == bytes(range(10, 20))
                 assert resp.headers["transferMode.dlna.org"] == "Streaming"
+                assert resp.headers["Accept-Ranges"] == "bytes"
+                assert "DLNA.ORG_OP=01" in resp.headers["contentFeatures.dlna.org"]
     finally:
         await server.stop()
     await server.stop()
@@ -289,3 +315,56 @@ def test_guess_mime():
 
     assert dlna.guess_mime(Path("a.mp4")) == "video/mp4"
     assert dlna.guess_mime(Path("a.unknownext")) == "video/mp4"
+
+
+def test_local_addresses_skip_loopback_and_link_local(monkeypatch):
+    def adapter(*ips):
+        return SimpleNamespace(ips=[SimpleNamespace(ip=ip) for ip in ips])
+
+    monkeypatch.setattr(
+        dlna.ifaddr, "get_adapters",
+        lambda: [adapter("127.0.0.1"), adapter("10.0.0.5", ("fe80::1", 0, 0)),
+                 adapter("169.254.1.2", "100.64.0.9")],
+    )  # fmt: skip
+    assert REAL_LOCAL_ADDRESSES() == ["10.0.0.5", "100.64.0.9"]
+
+
+async def test_ssdp_search_skips_interfaces_it_cannot_bind(monkeypatch):
+    transport, _, target = await _responder("http://127.0.0.1:1/dmr")
+    # 203.0.113.1 (TEST-NET) is not one of our addresses, so binding to it fails
+    monkeypatch.setattr(dlna, "local_addresses", lambda: ["203.0.113.1", "127.0.0.1"])
+    try:
+        assert await dlna.ssdp_search(timeout=0.2, target=target) == ["http://127.0.0.1:1/dmr"]
+    finally:
+        transport.close()
+
+
+async def test_supports_hls_reads_the_renderers_media_types(renderer):
+    player = await _player(renderer)
+    assert not await player.supports_hls()  # mp4 and mkv only
+    renderer.sink += ",http-get:*:application/vnd.apple.mpegurl:*"
+    assert await player.supports_hls()
+    await player.close()
+
+
+async def test_supports_hls_is_false_when_it_cannot_tell(renderer):
+    player = await _player(renderer)
+    renderer.fail["GetProtocolInfo"] = 500
+    assert not await player.supports_hls()
+    player.renderer.connection_url = None
+    assert not await player.supports_hls()
+    await player.close()
+
+
+def test_guess_mime_uses_the_type_renderers_list_for_mkv():
+    from pathlib import Path
+
+    assert dlna.guess_mime(Path("a.MKV")) == "video/x-mkv"
+
+
+async def test_play_ignores_a_failing_initial_stop(renderer):
+    renderer.fail["Stop"] = 500  # e.g. nothing loaded yet
+    player = await _player(renderer)
+    await player.play("http://x/a.mp4")
+    assert [a for a, _ in renderer.actions][:3] == ["Stop", "SetAVTransportURI", "Play"]
+    await player.close()
